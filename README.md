@@ -5,7 +5,7 @@
 **One Python file. Many accounts. Every agent CLI in its own bubblewrap sandbox.**
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.4.0-blue)](https://github.com/flinner/silo/blob/main/silo)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue)](https://github.com/flinner/silo/blob/main/silo)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Sandbox](https://img.shields.io/badge/sandbox-bubblewrap-orange)](https://github.com/containers/bubblewrap)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey)](#limitations)
@@ -146,8 +146,8 @@ $ silo config --edit              # or open the JSON in $EDITOR
 
 ```json
 {
-  "config_version": "1.0",
-  "silo_min_version": "0.4.0",
+  "config_version": "1.1",
+  "silo_min_version": "0.5.0",
   "writable": ["~/code/tmp"],
   "readable": ["~/datasets"],
   "path_dirs": true,
@@ -155,7 +155,7 @@ $ silo config --edit              # or open the JSON in $EDITOR
   "gpg": true,
   "brokered": {"gh": ["pr", "issue", "run list", "run view", "repo view"]},
   "hidden": ["~/.config/gh", "~/.git-credentials", "~/.netrc", "~/.gnupg", "~/.aws"],
-  "ssh_key": "id_ed25519",
+  "ssh_keys": ["id_ed25519", "id_work"],
   "ssh_config": true,
   "ssh_hosts": ["mycluster", "*.lab.example.org"],
   "nice": 10,
@@ -175,7 +175,7 @@ $ silo config --edit              # or open the JSON in $EDITOR
 | `gpg` | `false` | Sign/decrypt through your gpg-agent's restricted socket |
 | `brokered` | `gh`: common subcommands | Commands run on the host, by allowed subcommand prefix |
 | `hidden` | common secret paths | Masked even inside mapped paths, on top of every tool's login files |
-| `ssh_key` | `""` | Key in `~/.ssh` loaded into the profile's private ssh-agent; empty = no ssh |
+| `ssh_keys` | `[]` | Keys in `~/.ssh` loaded into the profile's private ssh-agent; empty = no ssh |
 | `ssh_config` | `false` | Let brokered ssh use your `~/.ssh/config` (identity lines stripped) |
 | `ssh_hosts` | `[]` | Allowed ssh destinations, globs ok; empty = any host |
 | `nice` | `10` | CPU niceness, 0 (normal) to 19 (lowest) |
@@ -184,7 +184,7 @@ $ silo config --edit              # or open the JSON in $EDITOR
 | `swap_max` | `""` | Swap cap alongside `memory_max`, e.g. `0` |
 | `check_updates` | `ask` | `ask` \| `always` \| `never` |
 
-Environment overrides: `SILO_ROOT` (default `~/.config/silo`), `SILO_SSH_KEY`.
+Environment overrides: `SILO_ROOT` (default `~/.config/silo`), `SILO_SSH_KEYS` (space- or comma-separated).
 They apply to one run and are never written to the file.
 
 **Versioned.** The file records `config_version` and `silo_min_version`, the
@@ -206,7 +206,7 @@ host, which:
    any `-o` outside a small safe list (so no `ProxyCommand` or `LocalCommand`),
    unix-socket forwards, and destinations outside `ssh_hosts`;
 2. **runs the real ssh** with a per-profile `ssh-agent` holding only your
-   chosen key, and optionally your ssh config with every `IdentityFile`,
+   chosen keys (dropping one from the config restarts the agent without it), and optionally your ssh config with every `IdentityFile`,
    `IdentityAgent` and `CertificateFile` line removed;
 3. **ties lifetimes together** — if the agent's ssh is killed, the host ssh
    and anything it spawned are killed too.
@@ -244,7 +244,7 @@ Git over **https** has no broker: use ssh remotes (brokered above) or `gh`.
 │                               │            │                                  │
 │ ssh broker (per profile)      │ ◄───────── │ /usr/bin/ssh  = shim             │
 │  · vets argv, runs real ssh   │  unix sock │ ~/.ssh        = empty            │
-│  · ssh-agent with ONE key     │  + fds     │ /             = read-only        │
+│  · ssh-agent: chosen keys only│  + fds     │ /             = read-only        │
 │  · gh with your token         │            │ ~             = empty tmpfs      │
 │ $XDG_RUNTIME_DIR (hidden)     │            │ cwd, profile, writable = rw      │
 │ host ssh-agent, dbus (hidden) │            │ /tmp = NAME/tmp (persistent)     │

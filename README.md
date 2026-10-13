@@ -64,13 +64,23 @@ with no root, no containers and no daemon of its own:
 
 ## Install
 
+`silo` is one file. Download it, read it if you like, and put it on your `PATH`:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/flinner/silo/main/install.sh | sh
+curl -fLo ~/.local/bin/silo https://raw.githubusercontent.com/flinner/silo/main/silo
+chmod +x ~/.local/bin/silo
+ln -s silo ~/.local/bin/silo-codex      # optional: codex by default
 ```
 
-This puts `silo` (and the `silo-codex` alias) in `~/.local/bin` and tells you
-if a dependency is missing. Requirements: Linux, `bwrap`, Python 3.9+ with
-`click`, `rich` and `prompt_toolkit`:
+Or keep a git checkout and update with `git pull`:
+
+```bash
+git clone https://github.com/flinner/silo ~/.local/share/silo
+ln -s ~/.local/share/silo/silo ~/.local/bin/silo
+```
+
+Requirements: Linux, `bwrap`, Python 3.9+ with `click`, `rich` and
+`prompt_toolkit` (silo tells you if one is missing):
 
 ```bash
 sudo pacman -S bubblewrap python-click python-rich python-prompt_toolkit          # Arch
@@ -79,7 +89,8 @@ sudo dnf install bubblewrap python3-click python3-rich python3-prompt-toolkit   
 ```
 
 **Updates.** `silo check-update` tells you when a newer version exists and
-`silo update` installs it in place, after checking the download compiles.
+`silo update` installs it in place, after checking the download compiles
+(a git checkout is told to `git pull` instead).
 Normal commands check at most once a day — configurable with
 `check_updates = "ask" | "always" | "never"` (`ask` only prints a hint,
 `always` installs, `never` stays offline).

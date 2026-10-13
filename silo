@@ -7,10 +7,18 @@ import base64, fnmatch, urllib.request, json, os, re, select, shutil, signal, so
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import click
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
+try:
+    import click
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+except ImportError as e:
+    sys.exit(f"silo: missing Python package '{e.name}'. Install bubblewrap, click, rich and prompt_toolkit:\n"
+             "  Arch:          sudo pacman -S bubblewrap python-click python-rich python-prompt_toolkit\n"
+             "  Debian/Ubuntu: sudo apt install bubblewrap python3-click python3-rich python3-prompt-toolkit\n"
+             "  Fedora:        sudo dnf install bubblewrap python3-click python3-rich python3-prompt-toolkit")
+if not shutil.which("bwrap"):
+    sys.exit("silo: bubblewrap (bwrap) is not installed; see https://github.com/flinner/silo#install")
 
 VERSION = "0.2.0"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/silo/main/silo"

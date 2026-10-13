@@ -24,7 +24,7 @@ DEFAULTS = {"ssh_key": "", "ssh_config": False, "ssh_hosts": [], "writable": [],
 STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "silo"
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/cc-socks-{os.getuid()}"))
 
-out, err = Console(), Console(stderr=True)
+out, err = Console(highlight=False), Console(stderr=True, highlight=False)
 ok = lambda m: out.print(f"[green]✓[/] {m}")
 die = lambda m: (err.print(f"[red]✗[/] {m}"), sys.exit(1))
 

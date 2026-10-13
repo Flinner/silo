@@ -447,15 +447,14 @@ def install_update(text, remote):
     me = Path(os.path.realpath(sys.argv[0]))
     if (me.parent / ".git").exists():
         die(f"{me} is a git checkout; update it with [cyan]git -C {me.parent} pull[/]")
+    try:
+        compile(text, "silo", "exec")
+    except SyntaxError:
+        die("downloaded script does not compile; not installed")
     tmp = me.with_name(me.name + ".new")
     tmp.write_text(text)
     tmp.chmod(me.stat().st_mode)
-    try:
-        subprocess.run([sys.executable, "-m", "py_compile", tmp], check=True, capture_output=True)
-    except subprocess.CalledProcessError:
-        tmp.unlink()
-        die("downloaded script does not compile; not installed")
-    tmp.replace(me)
+    tmp.replace(me)                    # atomic rename over the old version
     ok(f"updated v{VERSION} → v{remote}  ({me})")
 
 

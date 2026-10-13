@@ -23,12 +23,10 @@ if [ -n "$missing" ]; then
 fi
 
 mkdir -p "$BIN"
-tmp=$(mktemp "$BIN/.silo.XXXXXX")
-trap 'rm -f "$tmp"' EXIT
+tmp=$(mktemp)                     # in /tmp; never deleted by this script
 curl -fsSL "$URL" -o "$tmp"
-head -1 "$tmp" | grep -q '^#!/usr/bin/env python3' || { warn "download does not look like silo"; exit 1; }
-chmod 755 "$tmp"
-mv "$tmp" "$BIN/silo"
+head -1 "$tmp" | grep -q '^#!/usr/bin/env python3' || { warn "download does not look like silo ($tmp)"; exit 1; }
+install -m 755 "$tmp" "$BIN/silo"
 ln -sfn silo "$BIN/silo-codex"
 say "installed $("$BIN/silo" --version 2>/dev/null || echo silo) to $BIN/silo (+ silo-codex)"
 case ":$PATH:" in *":$BIN:"*) ;; *) warn "$BIN is not on your PATH" ;; esac

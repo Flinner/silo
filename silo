@@ -20,7 +20,7 @@ except ImportError as e:
 if not shutil.which("bwrap"):
     sys.exit("silo: bubblewrap (bwrap) is not installed; see https://github.com/flinner/silo#install")
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/silo/main/silo"
 
 HOME = Path.home()
@@ -710,9 +710,17 @@ def init():
         out.print(f"  [bold]{tool.bin}[/]: logged in as [green]{tool.current_email() or '?'}[/]"
                   + (f"   [dim](profiles: {', '.join(have)})[/]" if have else ""))
         if click.confirm(f"  import this {tool.bin} login as a profile?", default=not have):
-            while (name := ask("    profile name:", default="main" if "main" not in have else "")) in have or not name:
-                err.print("    [yellow]pick a new, non-empty name[/]")
-            create(tool, name, current=True)
+            name = ask("    profile name (existing = replace its login, empty = skip):",
+                       default="" if "main" in have else "main", words=have)
+            if not name:
+                out.print("    [dim]skipped[/]")
+            elif name not in have:
+                create(tool, name, current=True)
+            elif click.confirm(f"    replace the login of profile '{name}' "
+                               f"({tool.email(ROOT / tool.bin / name) or '?'}) with this one?", default=False):
+                for f in tool.login:
+                    shutil.copy2(f, ROOT / tool.bin / name)
+                ok(f"{tool.bin} profile [bold]{name}[/] now uses the current login")
 
     out.rule("[bold]2. Filesystem[/]")
     out.print("  Your home is [bold]empty[/] in the sandbox (a scratch tmpfs).  The working directory and the\n"

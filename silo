@@ -20,7 +20,7 @@ except ImportError as e:
 if not shutil.which("bwrap"):
     sys.exit("silo: bubblewrap (bwrap) is not installed; see https://github.com/flinner/silo#install")
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/silo/main/silo"
 
 HOME = Path.home()
@@ -97,7 +97,8 @@ TOOLS = {
                    copy=["settings.json"], link=["CLAUDE.md", "AGENTS.md", "skills"],
                    login=[HOME / ".claude/.credentials.json", HOME / ".claude.json"],
                    cred=".credentials.json", login_cmd="auth login",
-                   email=lambda d: claude_email(d if (d / ".claude.json").exists() else HOME),
+                   # default config dir keeps its state in ~/.claude.json (a ~/.claude/.claude.json is stale)
+                   email=lambda d: claude_email(HOME if d == HOME / ".claude" else d),
                    binds=claude_binds, setenv={"DISABLE_AUTOUPDATER": "1"}, stop=["daemon", "stop", "--any"]),
     "codex": Tool("codex", "CODEX_HOME", HOME / ".codex",
                   copy=["config.toml"], link=["AGENTS.md"],
@@ -121,6 +122,7 @@ registry of [cyan]~/.claude[/], so sessions (sandboxed or not, any account) can 
 
 EXAMPLES = """\
 [dim]$[/] silo init                      [dim]# onboarding: import logins, pick paths and ssh key[/]
+[dim]$[/] silo config nice 5             [dim]# change one setting (silo config: show all)[/]
 [dim]$[/] silo new work && silo work auth login
 [dim]$[/] silo work                      [dim]# interactive claude session as 'work'[/]
 [dim]$[/] silo work -c                   [dim]# any claude flag passes through[/]
@@ -500,7 +502,7 @@ def auto_check():
 def cli(ctx, tool):
     """Run agent CLIs under named accounts, each sandboxed with bubblewrap."""
     ctx.obj = TOOLS[tool]
-    if ctx.invoked_subcommand not in (None, "run", "update", "check-update", "_broker"):
+    if ctx.invoked_subcommand not in (None, "run", "update", "check-update", "_broker", "config"):
         ctx.call_on_close(auto_check)
     if ctx.invoked_subcommand is None:
         out.print(ctx.get_help())
@@ -687,6 +689,97 @@ def rm(tool, name):
     shutil.rmtree(d)
     ok(f"removed {tool.bin} profile [bold]{name}[/]")
 
+
+
+CHOICES = {"ionice": ["idle", "low", "normal"], "check_updates": ["ask", "always", "never"]}
+
+
+def raw_cfg():
+    try:
+        return json.loads(CONFIG.read_text())
+    except OSError:
+        return {}
+    except ValueError as e:
+        die(f"{CONFIG} is not valid JSON: {e}")
+
+
+def coerce(key, values):
+    d = DEFAULTS[key]
+    if isinstance(d, list):
+        return [v.replace(str(HOME), "~", 1) if v.startswith(str(HOME)) else v for v in values]
+    if len(values) != 1:
+        die(f"{key} takes one value")
+    v = values[0]
+    if isinstance(d, bool):
+        if v.lower() not in ("true", "false", "yes", "no", "on", "off", "1", "0"):
+            die(f"{key} is yes or no")
+        return v.lower() in ("true", "yes", "on", "1")
+    if isinstance(d, int):
+        try:
+            v = int(v)
+        except ValueError:
+            die(f"{key} must be a number")
+        if key == "nice" and not 0 <= v <= 19:
+            die("nice must be between 0 and 19")
+        return v
+    if key in CHOICES and v not in CHOICES[key]:
+        die(f"{key} must be one of: {', '.join(CHOICES[key])}")
+    return v
+
+
+def show(v):
+    if isinstance(v, list):
+        return ", ".join(v) if v else "[dim](none)[/]"
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    return str(v) if v != "" else "[dim](none)[/]"
+
+
+@cli.command(context_settings=dict(ignore_unknown_options=True))
+@click.argument("key", required=False)
+@click.argument("values", nargs=-1)
+@click.option("--add", "add", multiple=True, metavar="VALUE", help="append to a list setting")
+@click.option("--drop", "drop", multiple=True, metavar="VALUE", help="take a value out of a list setting")
+@click.option("--unset", is_flag=True, help="reset KEY to its default")
+@click.option("-e", "--edit", is_flag=True, help="open config.json in $EDITOR")
+def config(key, values, add, drop, unset, edit):
+    """Show or change settings:  config [KEY [VALUE...]]."""
+    raw = raw_cfg()
+    if edit:
+        if not CONFIG.exists():
+            CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG.write_text(json.dumps(DEFAULTS, indent=2) + "\n")
+        click.edit(filename=str(CONFIG))
+        raw_cfg()                                       # validate
+        return ok(f"saved {CONFIG}")
+    if key is None:
+        t = Table(box=None, padding=(0, 2), header_style="bold")
+        for c in ("Key", "Value", ""):
+            t.add_column(c)
+        for k, d in DEFAULTS.items():
+            t.add_row(f"[bold green]{k}[/]", show(raw.get(k, d)), "" if k in raw else "[dim]default[/]")
+        out.print(t)
+        return out.print(f"[dim]{CONFIG}  -  silo config KEY VALUE  /  --add / --drop / --unset / --edit[/]")
+    if key not in DEFAULTS:
+        die(f"unknown setting [bold]{key}[/]; one of: {', '.join(DEFAULTS)}")
+    if unset:
+        raw.pop(key, None)
+    elif add or drop:
+        if not isinstance(DEFAULTS[key], list):
+            die(f"--add/--drop work on list settings, not {key}")
+        cur = list(raw.get(key, DEFAULTS[key]))
+        cur += [v for v in coerce(key, list(add)) if v not in cur]
+        gone = coerce(key, list(drop))
+        raw[key] = [v for v in cur if v not in gone]
+    elif values:
+        raw[key] = coerce(key, list(values))
+    else:
+        return out.print(show(raw.get(key, DEFAULTS[key])))
+    if key == "ssh_key" and raw.get(key) and not (HOME / ".ssh" / raw[key]).exists():
+        die(f"~/.ssh/{raw[key]} not found")
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(raw, indent=2) + "\n")
+    ok(f"{key} = {show(raw.get(key, DEFAULTS[key]))}")
 
 
 @cli.command("check-update")

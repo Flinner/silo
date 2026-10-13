@@ -5,7 +5,7 @@
 **One Python file. Many accounts. Every agent CLI in its own bubblewrap sandbox.**
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.2.0-blue)](https://github.com/flinner/silo/blob/main/silo)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue)](https://github.com/flinner/silo/blob/main/silo)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Sandbox](https://img.shields.io/badge/sandbox-bubblewrap-orange)](https://github.com/containers/bubblewrap)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey)](#limitations)
@@ -117,6 +117,7 @@ Enter keeps the current answer.
 | Command | Does |
 |---|---|
 | `init` | Interactive onboarding; writes `~/.config/silo/config.json` |
+| `config [KEY [VALUE...]]` | Show all settings, read one, or set one (`--add` / `--drop` for lists, `--unset`, `--edit`) |
 | `ls [-a]` | Profiles of the selected tool (`-a`: all tools) with account, login and background-daemon state |
 | `new NAME [--current]` | Create a profile; `--current` copies this machine's current login |
 | `rm NAME [-y]` | Delete a profile, stopping its background agents and ssh broker first |
@@ -127,7 +128,17 @@ Enter keeps the current answer.
 
 ## Configuration
 
-`~/.config/silo/config.json`, written by `silo init`:
+`~/.config/silo/config.json`, written by `silo init` and `silo config`:
+
+```console
+$ silo config nice 5
+✓ nice = 5
+$ silo config writable --add ~/data
+✓ writable = ~/code/tmp, ~/data
+$ silo config memory_max --unset
+$ silo config --edit              # or open the JSON in $EDITOR
+```
+
 
 ```json
 {

@@ -1,0 +1,666 @@
+#!/usr/bin/env python3
+"""silo - run agent CLIs (claude, codex, ...) under named accounts, each sandboxed with bubblewrap.
+
+https://github.com/flinner/silo  -  MIT License
+"""
+import base64, fnmatch, urllib.request, json, os, re, select, shutil, signal, socket, subprocess, sys, threading, time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import click
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+
+VERSION = "0.1.0"
+RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/silo/main/silo"
+
+HOME = Path.home()
+ROOT = Path(os.environ.get("SILO_ROOT", HOME / ".config/silo"))  # ROOT/<tool>/<profile>
+CONFIG = ROOT / "config.json"                                     # written by `init`
+DEFAULTS = {"ssh_key": "", "ssh_config": False, "ssh_hosts": [], "writable": [], "check_updates": "ask",
+            "hidden": ["~/.config/gh", "~/.git-credentials", "~/.netrc", "~/.gnupg", "~/.password-store",
+                       "~/.aws", "~/.kube", "~/.docker/config.json", "~/.local/share/keyrings", "~/.pypirc"]}
+STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "silo"
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/cc-socks-{os.getuid()}"))
+
+out, err = Console(), Console(stderr=True)
+ok = lambda m: out.print(f"[green]✓[/] {m}")
+die = lambda m: (err.print(f"[red]✗[/] {m}"), sys.exit(1))
+
+
+def load_cfg():
+    cfg = dict(DEFAULTS)
+    try:
+        cfg.update(json.loads(CONFIG.read_text()))
+    except (OSError, ValueError):
+        pass
+    if os.environ.get("SILO_SSH_KEY"):
+        cfg["ssh_key"] = os.environ["SILO_SSH_KEY"]
+    return cfg
+
+
+def jwt_email(path):
+    """email claim of the id_token in an OpenAI-style auth.json, or None."""
+    try:
+        tok = json.loads(Path(path).read_text())["tokens"]["id_token"].split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(tok + "=" * (-len(tok) % 4)))
+        return claims.get("email") or claims.get("https://api.openai.com/profile", {}).get("email")
+    except Exception:
+        return None
+
+
+def claude_email(d):
+    try:
+        return json.loads((d / ".claude.json").read_text())["oauthAccount"]["emailAddress"]
+    except Exception:
+        return None
+
+
+def claude_binds(d):  # shared session registry + messaging sockets: sessions across profiles see each other
+    socks = RUNTIME / "cc-socks"
+    for p in (HOME / ".claude/sessions", d / "sessions", socks):
+        p.mkdir(parents=True, exist_ok=True)
+    return ["--bind", HOME / ".claude/sessions", d / "sessions", "--bind", socks, socks]
+
+
+@dataclass
+class Tool:
+    bin: str
+    env: str                      # env var naming the config dir
+    home: Path                    # the tool's default config dir, seeded from
+    copy: list = field(default_factory=list)   # files copied into a new profile (tool edits them)
+    link: list = field(default_factory=list)   # files symlinked into a new profile (shared)
+    login: list = field(default_factory=list)  # files copied by `new --current`
+    cred: str = ""                # file whose presence means "logged in"
+    login_cmd: str = ""           # how to log in
+    email: object = None          # fn(config_dir) -> email or None
+    binds: object = None          # fn(profile_dir) -> extra bwrap args
+    setenv: dict = field(default_factory=dict)
+    stop: list = field(default_factory=list)   # args to stop its background daemon before rm
+
+    def current_email(self):
+        return self.email(self.home) if self.email else None
+
+
+TOOLS = {
+    "claude": Tool("claude", "CLAUDE_CONFIG_DIR", HOME / ".claude",
+                   copy=["settings.json"], link=["CLAUDE.md", "AGENTS.md", "skills"],
+                   login=[HOME / ".claude/.credentials.json", HOME / ".claude.json"],
+                   cred=".credentials.json", login_cmd="auth login",
+                   email=lambda d: claude_email(d if (d / ".claude.json").exists() else HOME),
+                   binds=claude_binds, setenv={"DISABLE_AUTOUPDATER": "1"}, stop=["daemon", "stop", "--any"]),
+    "codex": Tool("codex", "CODEX_HOME", HOME / ".codex",
+                  copy=["config.toml"], link=["AGENTS.md"],
+                  login=[HOME / ".codex/auth.json"], cred="auth.json", login_cmd="login",
+                  email=lambda d: jwt_email(d / "auth.json")),
+}
+ALIASES = {"silo": "claude", "silo-codex": "codex"}  # argv[0] -> default tool
+
+ABOUT = """\
+Profiles live in [cyan]~/.config/agents/TOOL/NAME[/], each its own config dir
+({envs}), so any number run at once.  Claude profiles share the session
+registry of [cyan]~/.claude[/], so sessions (sandboxed or not, any account) can list and message each other.
+
+[bold]Tools[/]    {tools}.  Pick with [bold]-t[/], or by alias: {aliases}.
+         Add one by appending a [bold]Tool(...)[/] entry to TOOLS in this script.
+[bold]Sandbox[/]  home is read-only, secrets hidden; writable only [cyan]$PWD[/], the profile dir, the session sockets and the
+         writable paths from [cyan]init[/].  [cyan]/tmp[/] is a persistent per-profile dir, so background
+         agents and their daemon outlive the interactive session.  [cyan]~/.ssh[/] is replaced by
+         an empty dir; [bold]ssh[/] is brokered to the host with one key and an allowlist.
+[bold]Config[/]   [cyan]~/.config/agents/config.json[/] (from [cyan]init[/]); env SILO_ROOT, SILO_SSH_KEY"""
+
+EXAMPLES = """\
+[dim]$[/] silo init                      [dim]# onboarding: import logins, pick paths and ssh key[/]
+[dim]$[/] silo new work && silo work auth login
+[dim]$[/] silo work                      [dim]# interactive claude session as 'work'[/]
+[dim]$[/] silo work -c                   [dim]# any claude flag passes through[/]
+[dim]$[/] silo work --bg 'refactor X'    [dim]# background agent, survives exit[/]
+[dim]$[/] silo work --remote-control
+[dim]$[/] silo -t codex new main --current   [dim]# codex profile  (or the silo-codex alias)[/]
+[dim]$[/] silo-codex main --full-auto
+[dim]$[/] silo work --shell              [dim]# poke around inside the sandbox[/]"""
+
+
+class RichHelp:
+    def format_help(self, ctx, formatter):
+        out.print(f"[bold cyan]{ctx.command_path}[/] [dim]{' '.join(self.collect_usage_pieces(ctx))}[/]")
+        if self.help:
+            out.print(f"\n{self.help}\n")
+        if isinstance(self, click.Group):
+            t = Table(box=None, padding=(0, 2), show_header=False)
+            for name, cmd in self.commands.items():
+                if not cmd.hidden:
+                    t.add_row(f"[bold green]{name}[/] [dim]{' '.join(cmd.collect_usage_pieces(ctx))}[/]", cmd.help or "")
+            t.add_row("[bold green]NAME[/] [dim][TOOL ARGS]...[/]", "run the tool as profile NAME (any of its flags work)")
+            t.add_row("[bold green]NAME[/] [dim]--shell[/]", "a shell inside NAME's sandbox, for debugging")
+            out.print(Panel(t, title="Commands", title_align="left", border_style="dim"))
+            out.print(Panel(EXAMPLES, title="Examples", title_align="left", border_style="dim"))
+            about = ABOUT.format(tools=", ".join(TOOLS), envs=", ".join(t.env for t in TOOLS.values()),
+                                 aliases=", ".join(f"[bold]{a}[/]→{t}" for a, t in ALIASES.items()))
+            out.print(Panel(about, title="How it works", title_align="left", border_style="dim"))
+        opts = [p for p in self.params if isinstance(p, click.Option) and not p.hidden]
+        if opts:
+            t = Table(box=None, padding=(0, 2), show_header=False)
+            for p in opts:
+                t.add_row("[bold green]" + ", ".join(p.opts) + "[/]", p.help or "")
+            out.print(Panel(t, title="Options", title_align="left", border_style="dim"))
+
+
+class Cmd(RichHelp, click.Command):
+    pass
+
+
+class Cli(RichHelp, click.Group):
+    command_class = Cmd
+
+    def resolve_command(self, ctx, args):  # unknown subcommand == profile name
+        if args and args[0] not in self.commands and not args[0].startswith("-"):
+            return "run", run, args
+        return super().resolve_command(ctx, args)
+
+
+def profile(tool, name):
+    d = ROOT / tool.bin / name
+    if not d.is_dir():
+        die(f"no {tool.bin} profile [bold]{name}[/]  (see [cyan]ls[/] / [cyan]new[/])")
+    return d
+
+
+def daemon_alive(d):
+    return any(alive(s) for s in (d / "tmp").glob("cc-daemon-*/*/control.sock"))
+
+
+def ro_data(args, data: bytes, dest: Path, perms="0600"):
+    """Bind a generated file read-only at dest (via an inherited pipe fd)."""
+    r, w = os.pipe()
+    os.write(w, data)
+    os.close(w)
+    os.set_inheritable(r, True)
+    args += ["--perms", perms, "--ro-bind-data", str(r), str(dest)]
+
+
+# ---- ssh broker -------------------------------------------------------------
+# Inside the sandbox ~/.ssh is empty and /usr/bin/ssh is SHIM: it passes its argv and
+# stdin/stdout/stderr (fds, so ttys work) to a host-side broker, which vets the args and
+# runs the real ssh with a per-profile ssh-agent holding only the chosen key and (optionally)
+# your ~/.ssh/config stripped of identity lines.  The agent can use ssh but read neither.
+SSH_ARG_OPTS = set("BbcDEeFIiJLlmOoPpQRSWw")       # ssh options taking a value
+SSH_BLOCKED = set("FiIESGJOwv")                      # host-file access, config dump, jumps, debug
+SAFE_O = {"batchmode", "connecttimeout", "serveraliveinterval", "serveralivecountmax",
+          "stricthostkeychecking", "requesttty", "forwardagent", "forwardx11", "permitlocalcommand",
+          "clearallforwardings", "remotecommand", "controlmaster", "sendenv", "compression",
+          "loglevel", "port", "user", "exitonforwardfailure", "setenv"}
+SAFE_O_VALUES = {"forwardagent": {"no"}, "forwardx11": {"no"}, "permitlocalcommand": {"no"},
+                 "remotecommand": {"none"}, "controlmaster": {"no"}, "sendenv": {"git_protocol"}}
+SHIM = """#!/usr/bin/python3 -I
+import json, os, socket, sys
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect({sock!r})
+except OSError as e:
+    sys.exit(f"ssh (sandbox): broker unavailable: {{e}}")
+socket.send_fds(s, [json.dumps({{"argv": sys.argv[1:], "term": os.environ.get("TERM", "")}}).encode()], [0, 1, 2])
+data = b""
+while chunk := s.recv(4096):
+    data += chunk
+sys.exit(json.loads(data or b'{{"rc": 255}}')["rc"])
+"""
+
+
+def ssh_vet(argv, cfg):
+    """None if ok, else the reason argv is refused."""
+    dest, i = None, 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            dest = dest or (argv[i + 1] if i + 1 < len(argv) else None)
+            break
+        if a.startswith("-") and len(a) > 1:
+            j = 1
+            while j < len(a):
+                c = a[j]
+                if c in SSH_BLOCKED:
+                    return f"option -{c} is not allowed in the sandbox"
+                if c in SSH_ARG_OPTS:
+                    val = a[j + 1:] or (argv[i + 1] if i + 1 < len(argv) else "")
+                    if not a[j + 1:]:
+                        i += 1
+                    if c == "o":
+                        k, _, v = val.replace(" ", "=", 1).partition("=")
+                        k, v = k.strip().lower(), v.strip().lower()
+                        if k not in SAFE_O or (k in SAFE_O_VALUES and v not in SAFE_O_VALUES[k]):
+                            return f"-o {val} is not allowed in the sandbox"
+                    if c in "LRD" and "/" in val:
+                        return "unix-socket forwarding is not allowed in the sandbox"
+                    break
+                j += 1
+        elif dest is None:
+            dest = a
+        else:
+            break                               # rest is the remote command
+        i += 1
+    if not dest:
+        return None                             # e.g. `ssh -V`; ssh prints usage itself
+    host = re.sub(r"^ssh://", "", dest).rsplit("@", 1)[-1]
+    host = re.sub(r":\d+$", "", host).strip("[]")
+    allowed = cfg["ssh_hosts"]
+    if allowed and not any(fnmatch.fnmatch(host, pat) for pat in allowed):
+        return f"host '{host}' is not in the allowed list ({', '.join(allowed)}); see `init`"
+    return None
+
+
+def alive(path):
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(0.3)
+            s.connect(str(path))
+            return True
+    except OSError:
+        return False
+
+
+def rtdir(tool, name):  # host-only state; $XDG_RUNTIME_DIR is hidden from the sandbox
+    d = RUNTIME / "silo" / f"{tool.bin}-{name}"
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return d
+
+
+def ensure_broker(tool, name, cfg):
+    """start the profile's ssh-agent + broker if needed; return the broker socket path."""
+    rt, d = rtdir(tool, name), profile(tool, name)
+    agent = rt / "agent.sock"
+    if not alive(agent):
+        agent.unlink(missing_ok=True)
+        r = subprocess.run(["ssh-agent", "-s", "-a", agent], capture_output=True, text=True, check=True)
+        (rt / "agent.pid").write_text(re.search(r"SSH_AGENT_PID=(\d+)", r.stdout)[1])
+    env = {**os.environ, "SSH_AUTH_SOCK": str(agent)}
+    if subprocess.run(["ssh-add", "-l"], env=env, capture_output=True).returncode != 0:
+        subprocess.run(["ssh-add", "-q", HOME / ".ssh" / cfg["ssh_key"]], env=env, check=True)
+    sock = d / "ssh.sock"
+    if not alive(sock):
+        sock.unlink(missing_ok=True)
+        subprocess.Popen([sys.executable, os.path.realpath(sys.argv[0]), "-t", tool.bin, "_broker", name],
+                         start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=open(rt / "broker.log", "a"))
+        for _ in range(50):
+            if alive(sock):
+                break
+            time.sleep(0.05)
+        else:
+            die(f"ssh broker did not start; see {rt / 'broker.log'}")
+    return sock
+
+
+def broker_serve(tool, name):
+    rt, d = rtdir(tool, name), profile(tool, name)
+    sock = d / "ssh.sock"
+    sock.unlink(missing_ok=True)
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(str(sock))
+    os.chmod(sock, 0o600)
+    srv.listen()
+    (rt / "broker.pid").write_text(str(os.getpid()))
+
+    def handle(conn):
+        fds = []
+        try:
+            msg, fds, _, _ = socket.recv_fds(conn, 1 << 20, 3)
+            req = json.loads(msg)
+            cfg = load_cfg()
+            why = "no ssh key configured; see `init`" if not cfg["ssh_key"] else ssh_vet(req["argv"], cfg)
+            if why:
+                os.write(fds[2], f"ssh (sandbox): {why}\n".encode())
+                rc = 255
+            else:
+                key = HOME / ".ssh" / cfg["ssh_key"]
+                conf = rt / "ssh_config"
+                text = (HOME / ".ssh/config").read_text() if cfg["ssh_config"] and (HOME / ".ssh/config").exists() else ""
+                conf.write_text(re.sub(r"(?im)^\s*(IdentityFile|IdentityAgent|CertificateFile|PKCS11Provider|"
+                                       r"SecurityKeyProvider|ControlPath|LocalCommand)\b.*$", "", text))
+                pub = key.with_name(key.name + ".pub")
+                env = {**os.environ, "SSH_AUTH_SOCK": str(rt / "agent.sock"), "TERM": req.get("term") or "dumb"}
+                p = subprocess.Popen(["/usr/bin/ssh", "-F", conf, "-o", f"IdentityAgent={rt / 'agent.sock'}",
+                                      "-o", "IdentitiesOnly=yes", "-i", pub if pub.exists() else key, *req["argv"]],
+                                     stdin=fds[0], stdout=fds[1], stderr=fds[2], env=env, cwd=HOME,
+                                     start_new_session=True)  # own group: kill ProxyCommand children too
+                for f in fds:
+                    os.close(f)
+                fds = []
+                while p.poll() is None:              # shim gone (killed) -> kill ssh
+                    if select.select([conn], [], [], 0.2)[0] and conn.recv(1) == b"":
+                        os.killpg(p.pid, signal.SIGTERM)
+                        p.wait()
+                rc = p.returncode
+            conn.sendall(json.dumps({"rc": rc}).encode())
+        except Exception as e:  # never take the broker down
+            print(f"broker: {e!r}", file=sys.stderr, flush=True)
+        finally:
+            for f in fds:
+                os.close(f)
+            conn.close()
+
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+
+def stop_ssh(tool, name):
+    rt = RUNTIME / "silo" / f"{tool.bin}-{name}"
+    for f in ("broker.pid", "agent.pid"):
+        try:
+            os.kill(int((rt / f).read_text()), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+    shutil.rmtree(rt, ignore_errors=True)
+
+
+def sandbox(tool, name):
+    """bwrap argv (without the command) for profile NAME of TOOL."""
+    cfg = load_cfg()
+    d = profile(tool, name)
+    wd = Path.cwd().resolve()
+    (d / "tmp").mkdir(exist_ok=True)
+
+    b = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+         "--bind", d / "tmp", "/tmp",   # persistent per-profile /tmp: daemon sockets survive runs
+         "--tmpfs", RUNTIME,            # hide host sockets: keyring ssh-agent, dbus, emacs, terminals
+         "--unsetenv", "SSH_AUTH_SOCK", "--unsetenv", "DBUS_SESSION_BUS_ADDRESS",
+         "--tmpfs", ROOT]               # other profiles + config.json: never visible
+    # secrets: every tool's login files (all accounts) + the configured list
+    for f in [*(x for t in TOOLS.values() for x in t.login), *(Path(h).expanduser() for h in cfg["hidden"])]:
+        f = Path(f)
+        if f.is_dir():
+            b += ["--tmpfs", f]
+        elif f.exists():
+            b += ["--ro-bind", "/dev/null", f]
+    b += ["--bind", wd, wd, "--bind", d, d]
+    for p in cfg["writable"]:
+        p = Path(p).expanduser()
+        b += ["--bind-try", p, p]
+    if tool.binds:
+        b += tool.binds(d)
+
+    b += ["--tmpfs", HOME / ".ssh"]       # never visible; ssh goes through the broker
+    if cfg["ssh_key"]:
+        ro_data(b, SHIM.format(sock=str(ensure_broker(tool, name, cfg))).encode(), Path("/usr/bin/ssh"), "0755")
+
+    b += ["--setenv", tool.env, d]
+    for k, v in tool.setenv.items():
+        b += ["--setenv", k, v]
+    # keep pid + net namespaces: claude sessions check pid-namespace identity for peers
+    b += ["--unshare-user", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try",
+          "--die-with-parent", "--chdir", wd]
+    return [str(x) for x in b]
+
+
+def create(tool, name, current):
+    d = ROOT / tool.bin / name
+    if d.exists():
+        die(f"{tool.bin} profile [bold]{name}[/] already exists")
+    d.mkdir(parents=True, mode=0o700)
+    for f in tool.copy:   # per-profile copies: the tool edits them
+        if (tool.home / f).exists():
+            shutil.copy(tool.home / f, d)
+    for f in tool.link:   # shared with the tool's main config
+        if (tool.home / f).exists():
+            (d / f).symlink_to(tool.home / f)
+    if current:
+        for f in tool.login:
+            shutil.copy2(f, d)
+        ok(f"created {tool.bin} profile [bold]{name}[/] with the current login")
+    else:
+        ok(f"created {tool.bin} profile [bold]{name}[/]  -  now run:  [cyan]{Path(sys.argv[0]).name} {name} {tool.login_cmd}[/]")
+
+
+# ---- interactive prompts (prompt_toolkit when on a tty, plain input otherwise) ----
+def ask(label, default="", paths=False, words=()):
+    if sys.stdin.isatty():
+        from prompt_toolkit import prompt
+        from prompt_toolkit.completion import PathCompleter, WordCompleter
+        comp = PathCompleter(expanduser=True) if paths else WordCompleter(list(words)) if words else None
+        return prompt(f"{label} ", default=default, completer=comp, complete_while_typing=bool(words)).strip()
+    out.print(f"{label} [dim]{default}[/]", end=" ")
+    return (input() or default).strip()
+
+
+# ---- updates (never silent: `ask` prints a hint, `always` installs, `never` skips) ----
+def _vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def fetch_remote(quiet=False):
+    try:
+        with urllib.request.urlopen(RAW_SELF_URL, timeout=5) as r:
+            text = r.read().decode()
+    except OSError as e:
+        if quiet:
+            raise
+        die(f"could not fetch {RAW_SELF_URL}: {e}")
+    m = re.search(r'^VERSION = "([^"]+)"', text, re.M)
+    if not m or not text.startswith("#!/usr/bin/env python3"):
+        die("fetched script has no VERSION marker; refusing to trust it")
+    return m[1], text
+
+
+def install_update(text, remote):
+    me = Path(os.path.realpath(sys.argv[0]))
+    if (me.parent / ".git").exists():
+        die(f"{me} is a git checkout; update it with [cyan]git -C {me.parent} pull[/]")
+    tmp = me.with_name(me.name + ".new")
+    tmp.write_text(text)
+    tmp.chmod(me.stat().st_mode)
+    try:
+        subprocess.run([sys.executable, "-m", "py_compile", tmp], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        tmp.unlink()
+        die("downloaded script does not compile; not installed")
+    tmp.replace(me)
+    ok(f"updated v{VERSION} → v{remote}  ({me})")
+
+
+def auto_check():
+    """at most daily, after a command; network failures are silent."""
+    mode = load_cfg()["check_updates"]
+    stamp = STATE / "last-update-check"
+    if mode == "never" or not sys.stderr.isatty():
+        return
+    try:
+        if time.time() - stamp.stat().st_mtime < 86400:
+            return
+    except OSError:
+        pass
+    STATE.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+    try:
+        remote, text = fetch_remote(quiet=True)
+    except BaseException:
+        return
+    if _vtuple(remote) > _vtuple(VERSION):
+        if mode == "always":
+            install_update(text, remote)
+        else:
+            err.print(f"[yellow]↑[/] silo v{remote} is available (you have v{VERSION}) - run [cyan]silo update[/]")
+
+
+@click.group(cls=Cli, context_settings=dict(help_option_names=["-h", "--help"]), invoke_without_command=True)
+@click.option("-t", "--tool", type=click.Choice(list(TOOLS)), default=ALIASES.get(Path(sys.argv[0]).name, "claude"),
+              show_default=True, help="which agent CLI")
+@click.version_option(VERSION, "-V", "--version", prog_name="silo")
+@click.pass_context
+def cli(ctx, tool):
+    """Run agent CLIs under named accounts, each sandboxed with bubblewrap."""
+    ctx.obj = TOOLS[tool]
+    if ctx.invoked_subcommand not in (None, "run", "update", "check-update", "_broker"):
+        ctx.call_on_close(auto_check)
+    if ctx.invoked_subcommand is None:
+        out.print(ctx.get_help())
+
+
+@cli.command()
+def init():
+    """Onboarding: import existing logins, choose writable paths and the ssh key."""
+    cfg = load_cfg()
+    out.print(Panel("Answers are saved to [cyan]{}[/].  Re-run any time; Enter keeps the current value.".format(CONFIG),
+                    title="silo init", border_style="cyan"))
+
+    out.rule("[bold]1. Existing logins → profiles[/]")
+    for tool in TOOLS.values():
+        if not (tool.home / tool.cred).exists():
+            out.print(f"  [dim]{tool.bin}: no login found in {tool.home}[/]")
+            continue
+        have = sorted(p.name for p in (ROOT / tool.bin).glob("*/"))
+        out.print(f"  [bold]{tool.bin}[/]: logged in as [green]{tool.current_email() or '?'}[/]"
+                  + (f"   [dim](profiles: {', '.join(have)})[/]" if have else ""))
+        if click.confirm(f"  import this {tool.bin} login as a profile?", default=not have):
+            name = ask("    profile name:", default="main")
+            create(tool, name, current=True)
+
+    out.rule("[bold]2. Writable paths inside the sandbox[/]")
+    out.print("  Always writable: the working directory and the profile dir.  Add more (Tab completes paths, empty line ends).")
+    paths = []
+    for p in cfg["writable"]:
+        if click.confirm(f"  keep {p}?", default=True):
+            paths.append(p)
+    while p := ask("  add path:", paths=True):
+        if not Path(p).expanduser().exists():
+            out.print(f"    [yellow]warning:[/] {p} does not exist (it will be skipped when running)")
+        paths.append(p.replace(str(HOME), "~", 1) if p.startswith(str(HOME)) else p)
+    cfg["writable"] = paths
+
+    out.rule("[bold]3. SSH[/]")
+    sshdir = HOME / ".ssh"
+    keys = sorted(f.name for f in sshdir.glob("*") if f.is_file() and f.suffix != ".pub"
+                  and f.name not in ("config", "known_hosts", "known_hosts.old", "authorized_keys", "environment"))
+    out.print("  The agent never sees [cyan]~/.ssh[/].  Its [bold]ssh[/] is brokered: the real ssh runs outside the\n"
+              "  sandbox with a private ssh-agent holding one key.  Keys found: "
+              + (", ".join(f"[bold]{k}[/]" for k in keys) if keys else "[dim]none[/]"))
+    key = ask("  key to load (empty = no ssh in the sandbox):", default=cfg["ssh_key"], words=keys)
+    if key and not (sshdir / key).exists():
+        die(f"~/.ssh/{key} not found")
+    cfg["ssh_key"] = key
+    hosts_in_cfg = []
+    if key and (sshdir / "config").exists():
+        cfg["ssh_config"] = click.confirm("  let brokered ssh use your ~/.ssh/config (aliases, ProxyJump...)?"
+                                          " The agent still can't read it.", default=cfg["ssh_config"])
+        if cfg["ssh_config"]:
+            hosts_in_cfg = sorted({h for line in (sshdir / "config").read_text().splitlines()
+                                   if line.strip().lower().startswith("host ")
+                                   for h in line.split()[1:] if not any(c in h for c in "*?!")})
+    else:
+        cfg["ssh_config"] = False
+    if key:
+        out.print("  Allowed destinations (Tab completes your config's hosts, globs ok, empty line ends;"
+                  " none = any host).")
+        hosts = [h for h in cfg["ssh_hosts"] if click.confirm(f"  keep {h}?", default=True)]
+        while h := ask("  allow host:", words=hosts_in_cfg):
+            hosts.append(h)
+        cfg["ssh_hosts"] = hosts
+
+    out.rule("[bold]4. Hidden paths[/]")
+    out.print("  Your home is readable (read-only) in the sandbox, except these.  Every tool's login files and\n"
+              "  other silo profiles are always hidden.  Tab completes paths, empty line ends.")
+    hidden = [h for h in cfg["hidden"] if click.confirm(f"  keep hiding {h}?", default=True)]
+    while h := ask("  hide path:", paths=True):
+        hidden.append(h.replace(str(HOME), "~", 1) if h.startswith(str(HOME)) else h)
+    cfg["hidden"] = hidden
+
+    out.rule("[bold]5. Updates[/]")
+    cfg["check_updates"] = ask("  check GitHub daily for a new silo? ask = tell me, always = install, never:",
+                               default=cfg["check_updates"], words=["ask", "always", "never"])
+    if cfg["check_updates"] not in ("ask", "always", "never"):
+        die("check_updates must be ask, always or never")
+
+    ROOT.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    t = Table(box=None, show_header=False, padding=(0, 2))
+    t.add_row("writable", ", ".join(cfg["writable"]) or "[dim]-[/]")
+    t.add_row("ssh key", cfg["ssh_key"] or "[dim]none[/]")
+    t.add_row("ssh config", "yes" if cfg["ssh_config"] else "no")
+    t.add_row("hidden", f"{len(cfg['hidden'])} paths + all logins")
+    t.add_row("updates", cfg["check_updates"])
+    t.add_row("ssh hosts", ", ".join(cfg["ssh_hosts"]) or ("[yellow]any[/]" if cfg["ssh_key"] else "[dim]-[/]"))
+    out.print(Panel(t, title="saved", border_style="green"))
+    ok(f"done - try [cyan]{Path(sys.argv[0]).name} ls -a[/]")
+
+
+@cli.command(cls=Cmd, context_settings=dict(ignore_unknown_options=True, allow_extra_args=True), hidden=True)
+@click.argument("name")
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+@click.pass_obj
+def run(tool, name, args):
+    cmd = [os.environ.get("SHELL", "/bin/sh")] if list(args) == ["--shell"] else [tool.bin, *args]
+    os.execvp("bwrap", sandbox(tool, name) + cmd)
+
+
+@cli.command("_broker", cls=Cmd, hidden=True)
+@click.argument("name")
+@click.pass_obj
+def _broker(tool, name):
+    broker_serve(tool, name)
+
+
+@cli.command()
+@click.option("-a", "--all", "every", is_flag=True, help="all tools, not just the selected one")
+@click.pass_obj
+def ls(tool, every):
+    """List profiles."""
+    t = Table(box=None, padding=(0, 2), header_style="bold")
+    for c in ("Tool", "Profile", "Account", "Login", "Background"):
+        t.add_column(c)
+    for tl in (TOOLS.values() if every else [tool]):
+        for d in sorted((ROOT / tl.bin).glob("*/")):
+            email = (tl.email and tl.email(d)) or "[dim]-[/]"
+            login = "[green]ok[/]" if (d / tl.cred).exists() else "[yellow]not logged in[/]"
+            bg = "[cyan]daemon running[/]" if daemon_alive(d) else "[dim]-[/]"
+            t.add_row(f"[dim]{tl.bin}[/]", f"[bold]{d.name}[/]", email, login, bg)
+    if t.row_count:
+        out.print(t)
+    else:
+        out.print(f"[dim]no {'' if every else tool.bin + ' '}profiles yet - try[/] init")
+
+
+@cli.command()
+@click.argument("name")
+@click.option("--current", is_flag=True, help="copy this machine's current login (no re-auth needed)")
+@click.pass_obj
+def new(tool, name, current):
+    """Create profile NAME."""
+    create(tool, name, current)
+
+
+@cli.command()
+@click.argument("name")
+@click.confirmation_option("-y", "--yes", prompt="Delete this profile, its sessions and login?")
+@click.pass_obj
+def rm(tool, name):
+    """Delete profile NAME (stops its background agents first)."""
+    d = profile(tool, name)
+    if tool.stop and daemon_alive(d):
+        subprocess.run(sandbox(tool, name) + [tool.bin, *tool.stop], stdin=subprocess.DEVNULL)
+    stop_ssh(tool, name)
+    shutil.rmtree(d)
+    ok(f"removed {tool.bin} profile [bold]{name}[/]")
+
+
+
+@cli.command("check-update")
+def check_update():
+    """Check GitHub for a newer silo (never installs)."""
+    remote, _ = fetch_remote()
+    if _vtuple(remote) > _vtuple(VERSION):
+        out.print(f"[yellow]↑[/] v{remote} is available (you have v{VERSION}) - run [cyan]silo update[/]")
+    else:
+        ok(f"up to date (v{VERSION})")
+
+
+@cli.command()
+def update():
+    """Install the latest silo from GitHub in place."""
+    remote, text = fetch_remote()
+    if _vtuple(remote) <= _vtuple(VERSION):
+        return ok(f"up to date (v{VERSION})")
+    install_update(text, remote)
+
+
+cli()

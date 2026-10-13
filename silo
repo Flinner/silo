@@ -12,13 +12,14 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/silo/main/silo"
 
 HOME = Path.home()
 ROOT = Path(os.environ.get("SILO_ROOT", HOME / ".config/silo"))  # ROOT/<tool>/<profile>
 CONFIG = ROOT / "config.json"                                     # written by `init`
 DEFAULTS = {"ssh_key": "", "ssh_config": False, "ssh_hosts": [], "writable": [], "check_updates": "ask",
+            "nice": 10, "ionice": "idle", "memory_max": "", "swap_max": "",
             "hidden": ["~/.config/gh", "~/.git-credentials", "~/.netrc", "~/.gnupg", "~/.password-store",
                        "~/.aws", "~/.kube", "~/.docker/config.json", "~/.local/share/keyrings", "~/.pypirc"]}
 STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "silo"
@@ -381,8 +382,9 @@ def sandbox(tool, name):
     if tool.binds:
         b += tool.binds(d)
 
-    b += ["--tmpfs", HOME / ".ssh"]       # never visible; ssh goes through the broker
-    if cfg["ssh_key"]:
+    if (HOME / ".ssh").exists():
+        b += ["--tmpfs", HOME / ".ssh"]   # never visible; ssh goes through the broker
+    if cfg["ssh_key"] and Path("/usr/bin/ssh").exists():
         ro_data(b, SHIM.format(sock=str(ensure_broker(tool, name, cfg))).encode(), Path("/usr/bin/ssh"), "0755")
 
     b += ["--setenv", tool.env, d]
@@ -564,7 +566,17 @@ def init():
         hidden.append(h.replace(str(HOME), "~", 1) if h.startswith(str(HOME)) else h)
     cfg["hidden"] = hidden
 
-    out.rule("[bold]5. Updates[/]")
+    out.rule("[bold]5. Resources[/]")
+    out.print("  Applied to the sandbox and everything it starts, background agents included.")
+    cfg["nice"] = int(ask("  CPU nice, 0 (normal) to 19 (lowest):", default=str(cfg["nice"])) or 0)
+    cfg["ionice"] = ask("  IO priority, idle / low / normal:", default=cfg["ionice"], words=list(IONICE))
+    if cfg["ionice"] not in IONICE:
+        die("IO priority must be idle, low or normal")
+    cfg["memory_max"] = ask("  memory limit, e.g. 8G or 50% (empty = none):", default=cfg["memory_max"])
+    if cfg["memory_max"]:
+        cfg["swap_max"] = ask("  swap limit, e.g. 0 or 2G (empty = no limit):", default=cfg["swap_max"])
+
+    out.rule("[bold]6. Updates[/]")
     cfg["check_updates"] = ask("  check GitHub daily for a new silo? ask = tell me, always = install, never:",
                                default=cfg["check_updates"], words=["ask", "always", "never"])
     if cfg["check_updates"] not in ("ask", "always", "never"):
@@ -577,6 +589,8 @@ def init():
     t.add_row("ssh key", cfg["ssh_key"] or "[dim]none[/]")
     t.add_row("ssh config", "yes" if cfg["ssh_config"] else "no")
     t.add_row("hidden", f"{len(cfg['hidden'])} paths + all logins")
+    t.add_row("resources", f"nice {cfg['nice']}, io {cfg['ionice']}, memory {cfg['memory_max'] or 'unlimited'}"
+                           + (f", swap {cfg['swap_max']}" if cfg["swap_max"] else ""))
     t.add_row("updates", cfg["check_updates"])
     t.add_row("ssh hosts", ", ".join(cfg["ssh_hosts"]) or ("[yellow]any[/]" if cfg["ssh_key"] else "[dim]-[/]"))
     out.print(Panel(t, title="saved", border_style="green"))
@@ -589,7 +603,31 @@ def init():
 @click.pass_obj
 def run(tool, name, args):
     cmd = [os.environ.get("SHELL", "/bin/sh")] if list(args) == ["--shell"] else [tool.bin, *args]
-    os.execvp("bwrap", sandbox(tool, name) + cmd)
+    argv = limits(load_cfg()) + sandbox(tool, name) + cmd
+    os.execvp(argv[0], argv)
+
+
+IONICE = {"idle": ["-c", "3"], "low": ["-c", "2", "-n", "7"], "normal": []}
+
+
+def limits(cfg):
+    """prefix argv: memory cap via a systemd user scope (covers every child, background agents
+    included), then nice + ionice.  Missing pieces degrade with a warning, never block the run."""
+    pre = []
+    mem, swap = str(cfg["memory_max"]).strip(), str(cfg["swap_max"]).strip()
+    if mem or swap:
+        if shutil.which("systemd-run") and subprocess.run(
+                ["systemd-run", "--user", "--scope", "--quiet", "true"], capture_output=True).returncode == 0:
+            pre += ["systemd-run", "--user", "--scope", "--quiet", "--collect"]
+            pre += ["-p", f"MemoryMax={mem}"] if mem else []
+            pre += ["-p", f"MemorySwapMax={swap}"] if swap else []
+        else:
+            err.print("[yellow]![/] memory limit skipped: no systemd user session (systemd-run --user)")
+    if int(cfg["nice"] or 0):
+        pre += ["nice", "-n", str(int(cfg["nice"]))]
+    if IONICE.get(cfg["ionice"]) and shutil.which("ionice"):
+        pre += ["ionice", *IONICE[cfg["ionice"]]]
+    return pre
 
 
 @cli.command("_broker", cls=Cmd, hidden=True)

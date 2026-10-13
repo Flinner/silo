@@ -5,7 +5,7 @@
 **One Python file. Many accounts. Every agent CLI in its own bubblewrap sandbox.**
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.1.0-blue)](https://github.com/flinner/silo/blob/main/silo)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue)](https://github.com/flinner/silo/blob/main/silo)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Sandbox](https://img.shields.io/badge/sandbox-bubblewrap-orange)](https://github.com/containers/bubblewrap)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey)](#limitations)
@@ -58,6 +58,7 @@ with no root, no containers and no daemon of its own:
 | **Accounts side by side** | One config dir per profile. `silo work` and `silo main` run concurrently; claude sessions in different profiles can still list and message each other. |
 | **Secrets stay out** | Every tool's login files (all accounts), other profiles, and a configurable list (`~/.config/gh`, `~/.gnupg`, `~/.aws`, ...) are masked inside the sandbox. |
 | **ssh without keys** | The agent can `ssh`, `scp` and `git push` to hosts you allow; it can never read the key or your ssh config. |
+| **Polite by default** | Runs at `nice 10` and idle IO priority; an optional memory cap (a systemd user scope) covers the agent and everything it spawns. |
 | **Long-lived agents work** | Background agents (`--bg`), their daemon and Remote Control keep working across runs. |
 | **Any CLI** | claude and codex are built in; another agent CLI is one table entry. |
 
@@ -96,7 +97,8 @@ silo work                     # run claude as 'work'
 `silo init` scans what you already have: if claude or codex is logged in, it
 offers to import that login as a profile. It then asks which extra paths
 should be writable (Tab completes paths), which ssh key to load, which hosts
-to allow, which secrets to hide and how to handle updates. Re-run it any time;
+to allow, which secrets to hide, CPU/IO priority and memory limit, and how to
+handle updates. Re-run it any time;
 Enter keeps the current answer.
 
 ## Commands
@@ -123,6 +125,10 @@ Enter keeps the current answer.
   "ssh_key": "id_ed25519",
   "ssh_config": true,
   "ssh_hosts": ["mycluster", "*.lab.example.org"],
+  "nice": 10,
+  "ionice": "idle",
+  "memory_max": "8G",
+  "swap_max": "0",
   "check_updates": "ask"
 }
 ```
@@ -134,6 +140,10 @@ Enter keeps the current answer.
 | `ssh_key` | `""` | Key in `~/.ssh` loaded into the profile's private ssh-agent; empty = no ssh |
 | `ssh_config` | `false` | Let brokered ssh use your `~/.ssh/config` (identity lines stripped) |
 | `ssh_hosts` | `[]` | Allowed ssh destinations, globs ok; empty = any host |
+| `nice` | `10` | CPU niceness, 0 (normal) to 19 (lowest) |
+| `ionice` | `idle` | IO priority: `idle` \| `low` \| `normal` |
+| `memory_max` | `""` | Memory cap, e.g. `8G` or `50%`; needs a systemd user session, skipped with a warning otherwise |
+| `swap_max` | `""` | Swap cap alongside `memory_max`, e.g. `0` |
 | `check_updates` | `ask` | `ask` \| `always` \| `never` |
 
 Environment overrides: `SILO_ROOT` (default `~/.config/silo`), `SILO_SSH_KEY`.
@@ -186,6 +196,10 @@ holds the host ssh-agent, the session bus and editor/terminal servers — all
 ways out); `~/.config/silo` is masked except the active profile; secrets are
 masked with `/dev/null` or an empty tmpfs; then the working directory, the
 profile and your `writable` paths are bound read-write.
+
+**Resource limits.** `silo` execs `systemd-run --user --scope` (when a memory
+limit is set), then `nice` and `ionice`, then `bwrap`. Limits are inherited, so
+background agents and every tool the agent runs share the same cap.
 
 **Background agents and Remote Control.** Claude Code's background daemon
 listens on a socket under `/tmp`. Because each profile's `/tmp` persists,

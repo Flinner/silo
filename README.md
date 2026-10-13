@@ -50,7 +50,7 @@ run side by side. Every run is wrapped in [bubblewrap](https://github.com/contai
 
 Agent CLIs run arbitrary shell commands with your full user rights, and
 juggling accounts means copying credential files around. `silo` fixes both
-with no root, no containers and no daemon of its own:
+with no root, no containers and no system service:
 
 | | |
 |---|---|
@@ -273,7 +273,27 @@ background agents and every tool the agent runs share the same cap.
 **Background agents and Remote Control.** Claude Code's background daemon
 listens on a socket under `/tmp`. Because each profile's `/tmp` persists,
 `silo work --bg 'task'` keeps running after you exit, and the next
-`silo work agents` finds it. Remote Control works unchanged.
+`silo work agents` finds it. Remote Control works unchanged. `silo ls` shows
+which profiles have a daemon running.
+
+```bash
+silo work agents                    # list background sessions (attach, logs, stop by id)
+silo work stop ID                   # stop one session
+silo work daemon stop --any         # stop the daemon and all its sessions
+silo work daemon stop --any --keep-workers   # stop the daemon, leave sessions running
+```
+
+The daemon is started on demand ("transient"), which is why `daemon stop`
+needs `--any`. Run these from a project directory like any other silo command.
+
+**The ssh broker** (and the profile's ssh-agent) also run per profile, started
+on demand and idle otherwise. `silo rm NAME` stops them; to stop them earlier:
+
+```bash
+kill $(cat /run/user/$UID/silo/claude-NAME/broker.pid /run/user/$UID/silo/claude-NAME/agent.pid)
+```
+
+They start again on the profile's next run.
 
 **Talking between sessions.** Claude Code discovers peers through a session
 registry and sockets, and ignores peers in another PID namespace. silo shares

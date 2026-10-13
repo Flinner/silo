@@ -20,7 +20,7 @@ except ImportError as e:
 if not shutil.which("bwrap"):
     sys.exit("silo: bubblewrap (bwrap) is not installed; see https://github.com/flinner/silo#install")
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/silo/main/silo"
 
 HOME = Path.home()
@@ -28,6 +28,11 @@ ROOT = Path(os.environ.get("SILO_ROOT", HOME / ".config/silo"))  # ROOT/<tool>/<
 CONFIG = ROOT / "config.json"                                     # written by `init`
 DEFAULTS = {"ssh_key": "", "ssh_config": False, "ssh_hosts": [], "writable": [], "check_updates": "ask",
             "nice": 10, "ionice": "idle", "memory_max": "", "swap_max": "",
+            "readable": [], "path_dirs": True, "git_config": True, "gpg": False,
+            "brokered": {"gh": ["pr", "issue", "run list", "run view", "run watch", "run rerun",
+                                "run download", "workflow list", "workflow view", "workflow run",
+                                "repo view", "repo clone", "release list", "release view", "search",
+                                "status", "browse", "label list"]},
             "hidden": ["~/.config/gh", "~/.git-credentials", "~/.netrc", "~/.gnupg", "~/.password-store",
                        "~/.aws", "~/.kube", "~/.docker/config.json", "~/.local/share/keyrings", "~/.pypirc"]}
 STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "silo"
@@ -38,12 +43,45 @@ ok = lambda m: out.print(f"[green]✓[/] {m}")
 die = lambda m: (err.print(f"[red]✗[/] {m}"), sys.exit(1))
 
 
+# config.json carries its schema version and the oldest silo that understands it.
+# Bump CONFIG_VERSION minor for added keys (older silo warns, keeps going), major for
+# incompatible changes (older silo refuses); CONFIG_MIN_SILO is the silo release that
+# introduced the current schema.
+CONFIG_VERSION = "1.0"
+CONFIG_MIN_SILO = "0.4.0"
+META = ("config_version", "silo_min_version")
+
+
+def read_cfg():
+    """the file as written (no defaults, no env), after version checks."""
+    try:
+        raw = json.loads(CONFIG.read_text())
+    except OSError:
+        return {}
+    except ValueError as e:
+        die(f"{CONFIG} is not valid JSON: {e}")
+    need = raw.get("silo_min_version", "0")
+    if _vtuple(need) > _vtuple(VERSION):
+        die(f"{CONFIG} needs silo >= {need} (you have {VERSION}); run [cyan]silo update[/]")
+    have = raw.get("config_version", "0.0")
+    if _vtuple(have)[:1] > _vtuple(CONFIG_VERSION)[:1]:
+        die(f"{CONFIG} is config v{have}; this silo reads v{CONFIG_VERSION}. Run [cyan]silo update[/]")
+    if _vtuple(have) > _vtuple(CONFIG_VERSION):
+        err.print(f"[yellow]![/] config v{have} is newer than this silo (v{CONFIG_VERSION}); unknown keys are ignored")
+    return raw
+
+
+def save_cfg(raw):
+    """write only user settings + version stamps (never env overrides or defaults filled in)."""
+    body = {k: raw[k] for k in DEFAULTS if k in raw}
+    ROOT.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps({"config_version": CONFIG_VERSION, "silo_min_version": CONFIG_MIN_SILO,
+                                  **body}, indent=2) + "\n")
+
+
 def load_cfg():
     cfg = dict(DEFAULTS)
-    try:
-        cfg.update(json.loads(CONFIG.read_text()))
-    except (OSError, ValueError):
-        pass
+    cfg.update({k: v for k, v in read_cfg().items() if k in DEFAULTS})
     if os.environ.get("SILO_SSH_KEY"):
         cfg["ssh_key"] = os.environ["SILO_SSH_KEY"]
     return cfg
@@ -210,8 +248,9 @@ s = socket.socket(socket.AF_UNIX)
 try:
     s.connect({sock!r})
 except OSError as e:
-    sys.exit(f"ssh (sandbox): broker unavailable: {{e}}")
-socket.send_fds(s, [json.dumps({{"argv": sys.argv[1:], "term": os.environ.get("TERM", "")}}).encode()], [0, 1, 2])
+    sys.exit(f"{cmd} (sandbox): broker unavailable: {{e}}")
+req = {{"cmd": {cmd!r}, "argv": sys.argv[1:], "term": os.environ.get("TERM", ""), "cwd": os.getcwd()}}
+socket.send_fds(s, [json.dumps(req).encode()], [0, 1, 2])
 data = b""
 while chunk := s.recv(4096):
     data += chunk
@@ -278,15 +317,17 @@ def rtdir(tool, name):  # host-only state; $XDG_RUNTIME_DIR is hidden from the s
 
 
 def ensure_broker(tool, name, cfg):
-    """start the profile's ssh-agent + broker if needed; return the broker socket path."""
+    """start the profile's ssh-agent (if a key is set) + broker if needed; return the broker socket."""
     rt, d = rtdir(tool, name), profile(tool, name)
     agent = rt / "agent.sock"
-    if not alive(agent):
+    if not cfg["ssh_key"]:
+        pass
+    elif not alive(agent):
         agent.unlink(missing_ok=True)
         r = subprocess.run(["ssh-agent", "-s", "-a", agent], capture_output=True, text=True, check=True)
         (rt / "agent.pid").write_text(re.search(r"SSH_AGENT_PID=(\d+)", r.stdout)[1])
     env = {**os.environ, "SSH_AUTH_SOCK": str(agent)}
-    if subprocess.run(["ssh-add", "-l"], env=env, capture_output=True).returncode != 0:
+    if cfg["ssh_key"] and subprocess.run(["ssh-add", "-l"], env=env, capture_output=True).returncode != 0:
         subprocess.run(["ssh-add", "-q", HOME / ".ssh" / cfg["ssh_key"]], env=env, check=True)
     sock = d / "ssh.sock"
     if not alive(sock):
@@ -299,7 +340,7 @@ def ensure_broker(tool, name, cfg):
                 break
             time.sleep(0.05)
         else:
-            die(f"ssh broker did not start; see {rt / 'broker.log'}")
+            die(f"broker did not start; see {rt / 'broker.log'}")
     return sock
 
 
@@ -319,6 +360,22 @@ def broker_serve(tool, name):
             msg, fds, _, _ = socket.recv_fds(conn, 1 << 20, 3)
             req = json.loads(msg)
             cfg = load_cfg()
+            cmd = req.get("cmd", "ssh")
+            if cmd != "ssh":
+                why = cmd_vet(cmd, req["argv"], req.get("cwd", ""), cfg, rt)
+                if why:
+                    os.write(fds[2], f"{cmd} (sandbox): {why}\n".encode())
+                    rc = 126
+                else:
+                    env = {**os.environ, "TERM": req.get("term") or "dumb"}
+                    p = subprocess.Popen([shutil.which(cmd), *req["argv"]], cwd=req["cwd"], env=env,
+                                         stdin=fds[0], stdout=fds[1], stderr=fds[2], start_new_session=True)
+                    for f in fds:
+                        os.close(f)
+                    fds = []
+                    rc = attached(p, conn)
+                conn.sendall(json.dumps({"rc": rc}).encode())
+                return
             why = "no ssh key configured; see `init`" if not cfg["ssh_key"] else ssh_vet(req["argv"], cfg)
             if why:
                 os.write(fds[2], f"ssh (sandbox): {why}\n".encode())
@@ -338,11 +395,7 @@ def broker_serve(tool, name):
                 for f in fds:
                     os.close(f)
                 fds = []
-                while p.poll() is None:              # shim gone (killed) -> kill ssh
-                    if select.select([conn], [], [], 0.2)[0] and conn.recv(1) == b"":
-                        os.killpg(p.pid, signal.SIGTERM)
-                        p.wait()
-                rc = p.returncode
+                rc = attached(p, conn)
             conn.sendall(json.dumps({"rc": rc}).encode())
         except Exception as e:  # never take the broker down
             print(f"broker: {e!r}", file=sys.stderr, flush=True)
@@ -356,6 +409,56 @@ def broker_serve(tool, name):
         threading.Thread(target=handle, args=(conn,), daemon=True).start()
 
 
+def attached(p, conn):
+    """wait for p; if the shim goes away (killed), kill p's whole process group."""
+    while p.poll() is None:
+        if select.select([conn], [], [], 0.2)[0] and conn.recv(1) == b"":
+            os.killpg(p.pid, signal.SIGTERM)
+            p.wait()
+    return p.returncode
+
+
+def cmd_vet(cmd, argv, cwd, cfg, rt):
+    """None if a brokered (non-ssh) command may run on the host, else why not."""
+    allow = cfg["brokered"].get(cmd)
+    if allow is None or not shutil.which(cmd):
+        return "not brokered; see `silo config brokered`"
+    try:
+        roots = [Path(r) for r in json.loads((rt / "roots.json").read_text())]
+    except (OSError, ValueError):
+        roots = []
+    c = Path(cwd).resolve()
+    if not any(c == r or r in c.parents for r in roots):
+        return f"working directory {cwd} is outside the sandbox's writable paths"
+    if argv in ([], ["--help"], ["--version"]):
+        return None
+    words = [a for a in argv if not a.startswith("-")][:3]
+    if any(words[:len(a.split())] == a.split() for a in allow):
+        return None
+    return f"'{cmd} {' '.join(words)}' is not in the allowlist ({', '.join(allow)})"
+
+
+def gpg_binds(d):
+    """private GNUPGHOME in the profile: public keys + ownertrust copied in, agent = host's
+    restricted 'extra' socket (sign/decrypt only, pinentry on the host; secret keys never leave it)."""
+    gh = d / "gnupg"
+    gh.mkdir(mode=0o700, exist_ok=True)
+    (gh / "common.conf").write_text("")                    # no keyboxd: plain pubring.kbx
+    (gh / "gpg.conf").write_text("no-autostart\n")
+    pub = subprocess.run(["gpg", "--export"], capture_output=True).stdout
+    trust = subprocess.run(["gpg", "--export-ownertrust"], capture_output=True).stdout
+    q = ["gpg", "--homedir", gh, "--batch", "--quiet"]
+    subprocess.run(q + ["--import"], input=pub, capture_output=True)
+    subprocess.run(q + ["--import-ownertrust"], input=trust, capture_output=True)
+    extra = subprocess.run(["gpgconf", "--list-dirs", "agent-extra-socket"], capture_output=True, text=True).stdout.strip()
+    inner = subprocess.run(["gpgconf", "--homedir", gh, "--list-dirs", "agent-socket"],
+                           capture_output=True, text=True).stdout.strip()
+    if not (extra and inner and Path(extra).exists()):
+        err.print("[yellow]![/] gpg skipped: no running gpg-agent extra socket (gpgconf --launch gpg-agent)")
+        return []
+    return ["--bind", extra, inner, "--setenv", "GNUPGHOME", gh]
+
+
 def stop_ssh(tool, name):
     rt = RUNTIME / "silo" / f"{tool.bin}-{name}"
     for f in ("broker.pid", "agent.pid"):
@@ -366,36 +469,73 @@ def stop_ssh(tool, name):
     shutil.rmtree(rt, ignore_errors=True)
 
 
+def under(path, roots):
+    path = Path(path)
+    return any(path == r or r in path.parents for r in roots)
+
+
 def sandbox(tool, name):
-    """bwrap argv (without the command) for profile NAME of TOOL."""
+    """bwrap argv (without the command) for profile NAME of TOOL.  Home is an empty tmpfs:
+    only the cwd, the profile, `writable` (rw) and `readable`, PATH dirs, git config (ro) exist."""
     cfg = load_cfg()
     d = profile(tool, name)
     wd = Path.cwd().resolve()
+    if wd == HOME or wd in HOME.parents:                  # home itself, /home, /
+        die(f"run silo from a project directory: the working directory ({wd}) is mounted read-write")
     (d / "tmp").mkdir(exist_ok=True)
+    rw = [wd, d, *(Path(p).expanduser().resolve() for p in cfg["writable"])]
+    ro = [Path(p).expanduser() for p in cfg["readable"]]
+    if cfg["path_dirs"]:
+        ro += [Path(p) for p in os.environ.get("PATH", "").split(":")
+               if p and Path(p).is_dir() and HOME in Path(p).parents]
+    if cfg["git_config"]:
+        ro += [HOME / ".gitconfig", HOME / ".config/git"]
+    ro += [tool.home / f for f in tool.link]               # shared CLAUDE.md, AGENTS.md, skills
+    exe = shutil.which(tool.bin)
+    if exe and HOME in Path(exe).parents:                  # tool installed under home
+        real = Path(os.path.realpath(exe))
+        ro.append(real)
+        if not under(exe, ro):
+            ro.append((real, Path(exe)))
 
     b = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
          "--bind", d / "tmp", "/tmp",   # persistent per-profile /tmp: daemon sockets survive runs
          "--tmpfs", RUNTIME,            # hide host sockets: keyring ssh-agent, dbus, emacs, terminals
          "--unsetenv", "SSH_AUTH_SOCK", "--unsetenv", "DBUS_SESSION_BUS_ADDRESS",
-         "--tmpfs", ROOT]               # other profiles + config.json: never visible
-    # secrets: every tool's login files (all accounts) + the configured list
-    for f in [*(x for t in TOOLS.values() for x in t.login), *(Path(h).expanduser() for h in cfg["hidden"])]:
-        f = Path(f)
-        if f.is_dir():
-            b += ["--tmpfs", f]
-        elif f.exists():
-            b += ["--ro-bind", "/dev/null", f]
-    b += ["--bind", wd, wd, "--bind", d, d]
-    for p in cfg["writable"]:
-        p = Path(p).expanduser()
-        b += ["--bind-try", p, p]
+         "--tmpfs", HOME]               # empty, scratch: everything below is mapped back explicitly
+    for r in ro:
+        src, dst = r if isinstance(r, tuple) else (r, r)
+        if Path(src).exists() and not under(dst, rw):
+            b += ["--ro-bind", src, dst]
+    for r in rw:
+        b += ["--bind-try", r, r]
     if tool.binds:
         b += tool.binds(d)
 
-    if (HOME / ".ssh").exists():
-        b += ["--tmpfs", HOME / ".ssh"]   # never visible; ssh goes through the broker
+    # secrets inside anything mapped back: every tool's login files (all accounts) + `hidden`
+    seen = rw + [r[1] if isinstance(r, tuple) else r for r in ro]
+    for f in [*(x for t in TOOLS.values() for x in t.login), *(Path(h).expanduser() for h in cfg["hidden"]),
+              HOME / ".ssh", ROOT / "config.json"]:
+        f = Path(f)
+        if under(f, seen) and f.exists() and not under(d, [f]):
+            b += ["--tmpfs", f] if f.is_dir() else ["--ro-bind", "/dev/null", f]
+
+    rt = rtdir(tool, name)                                 # roots the broker accepts as cwd
+    try:
+        roots = set(json.loads((rt / "roots.json").read_text()))
+    except (OSError, ValueError):
+        roots = set()
+    (rt / "roots.json").write_text(json.dumps(sorted(roots | {str(r) for r in rw})))
+    shims = {c: shutil.which(c) for c in cfg["brokered"]}
+    shims = {c: x for c, x in shims.items() if x}
     if cfg["ssh_key"] and Path("/usr/bin/ssh").exists():
-        ro_data(b, SHIM.format(sock=str(ensure_broker(tool, name, cfg))).encode(), Path("/usr/bin/ssh"), "0755")
+        shims["ssh"] = "/usr/bin/ssh"
+    if shims:
+        sock = str(ensure_broker(tool, name, cfg))
+        for c, x in shims.items():
+            ro_data(b, SHIM.format(sock=sock, cmd=c).encode(), Path(x), "0755")
+    if cfg["gpg"] and shutil.which("gpgconf"):
+        b += gpg_binds(d)
 
     b += ["--setenv", tool.env, d]
     for k, v in tool.setenv.items():
@@ -430,8 +570,18 @@ def ask(label, default="", paths=False, words=()):
     if sys.stdin.isatty():
         from prompt_toolkit import prompt
         from prompt_toolkit.completion import PathCompleter, WordCompleter
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.key_binding.bindings.completion import generate_completions
         comp = PathCompleter(expanduser=True) if paths else WordCompleter(list(words)) if words else None
-        return prompt(f"{label} ", default=default, completer=comp, complete_while_typing=bool(words)).strip()
+        kb = KeyBindings()
+
+        @kb.add("tab")
+        def _(event):  # complete / cycle like readline; never insert a literal tab
+            if comp:
+                generate_completions(event)
+
+        return prompt(f"{label} ", default=default, completer=comp, key_bindings=kb,
+                      complete_while_typing=bool(words)).strip()
     out.print(f"{label} [dim]{default}[/]", end=" ")
     return (input() or default).strip()
 
@@ -494,6 +644,41 @@ def auto_check():
             err.print(f"[yellow]↑[/] silo v{remote} is available (you have v{VERSION}) - run [cyan]silo update[/]")
 
 
+def choose(label, choices, default):
+    """ask until the answer is one of choices (Tab completes)."""
+    while (v := ask(f"{label} ({' / '.join(choices)}):", default=default, words=choices)) not in choices:
+        err.print(f"    [yellow]pick one of: {', '.join(choices)}[/]")
+    return v
+
+
+def number(label, default, lo, hi):
+    while True:
+        v = ask(label, default=str(default))
+        if v.isdigit() and lo <= int(v) <= hi:
+            return int(v)
+        err.print(f"    [yellow]a number from {lo} to {hi}[/]")
+
+
+def keep_list(current, keep_label):
+    """show the list; one question keeps it all, 'n' goes item by item."""
+    if not current:
+        return []
+    out.print("    " + ", ".join(f"[cyan]{c}[/]" for c in current))
+    if click.confirm(f"  keep {'this' if len(current) == 1 else f'these {len(current)}'}?", default=True):
+        return list(current)
+    return [c for c in current if click.confirm(f"    {keep_label} {c}?", default=True)]
+
+
+def path_list(intro, current, keep_label, add_label):
+    out.print(intro)
+    vals = keep_list(current, keep_label)
+    while p := ask(f"  {add_label}", paths=True):
+        if not Path(p).expanduser().exists():
+            out.print(f"    [yellow]note:[/] {p} does not exist (skipped while it doesn't)")
+        vals.append(p.replace(str(HOME), "~", 1) if p.startswith(str(HOME)) else p)
+    return vals
+
+
 @click.group(cls=Cli, context_settings=dict(help_option_names=["-h", "--help"]), invoke_without_command=True)
 @click.option("-t", "--tool", type=click.Choice(list(TOOLS)), default=ALIASES.get(Path(sys.argv[0]).name, "claude"),
               show_default=True, help="which agent CLI")
@@ -510,50 +695,52 @@ def cli(ctx, tool):
 
 @cli.command()
 def init():
-    """Onboarding: import existing logins, choose writable paths and the ssh key."""
-    cfg = load_cfg()
-    out.print(Panel("Answers are saved to [cyan]{}[/].  Re-run any time; Enter keeps the current value.".format(CONFIG),
+    """Onboarding: logins, filesystem, brokered ssh/gpg/gh, limits, updates."""
+    cfg = {**DEFAULTS, **{k: v for k, v in read_cfg().items() if k in DEFAULTS}}   # file only, no env
+    out.print(Panel(f"Answers are saved to [cyan]{CONFIG}[/].  Re-run any time - Enter keeps the current\n"
+                    "value, Tab completes.  Change one setting later with [cyan]silo config KEY VALUE[/].",
                     title="silo init", border_style="cyan"))
 
-    out.rule("[bold]1. Existing logins → profiles[/]")
+    out.rule("[bold]1. Logins → profiles[/]")
     for tool in TOOLS.values():
         if not (tool.home / tool.cred).exists():
-            out.print(f"  [dim]{tool.bin}: no login found in {tool.home}[/]")
+            out.print(f"  [dim]{tool.bin}: not logged in on this machine[/]")
             continue
         have = sorted(p.name for p in (ROOT / tool.bin).glob("*/"))
         out.print(f"  [bold]{tool.bin}[/]: logged in as [green]{tool.current_email() or '?'}[/]"
                   + (f"   [dim](profiles: {', '.join(have)})[/]" if have else ""))
         if click.confirm(f"  import this {tool.bin} login as a profile?", default=not have):
-            name = ask("    profile name:", default="main")
+            while (name := ask("    profile name:", default="main" if "main" not in have else "")) in have or not name:
+                err.print("    [yellow]pick a new, non-empty name[/]")
             create(tool, name, current=True)
 
-    out.rule("[bold]2. Writable paths inside the sandbox[/]")
-    out.print("  Always writable: the working directory and the profile dir.  Add more (Tab completes paths, empty line ends).")
-    paths = []
-    for p in cfg["writable"]:
-        if click.confirm(f"  keep {p}?", default=True):
-            paths.append(p)
-    while p := ask("  add path:", paths=True):
-        if not Path(p).expanduser().exists():
-            out.print(f"    [yellow]warning:[/] {p} does not exist (it will be skipped when running)")
-        paths.append(p.replace(str(HOME), "~", 1) if p.startswith(str(HOME)) else p)
-    cfg["writable"] = paths
+    out.rule("[bold]2. Filesystem[/]")
+    out.print("  Your home is [bold]empty[/] in the sandbox (a scratch tmpfs).  The working directory and the\n"
+              "  profile are always read-write; silo refuses to run from your home itself.")
+    cfg["writable"] = path_list("  [bold]Extra read-write paths[/] (empty line ends):",
+                                cfg["writable"], "keep writable", "add writable path:")
+    cfg["readable"] = path_list("  [bold]Extra read-only paths[/] (empty line ends):",
+                                cfg["readable"], "keep readable", "add read-only path:")
+    cfg["path_dirs"] = click.confirm("  expose the PATH directories under your home (your installed tools), read-only?",
+                                     default=cfg["path_dirs"])
+    cfg["git_config"] = click.confirm("  expose ~/.gitconfig and ~/.config/git (name, email, aliases), read-only?",
+                                      default=cfg["git_config"])
 
-    out.rule("[bold]3. SSH[/]")
+    out.rule("[bold]3. Brokered access[/]")
+    out.print("  These run [bold]outside[/] the sandbox on the agent's behalf; keys and tokens never enter it.")
     sshdir = HOME / ".ssh"
     keys = sorted(f.name for f in sshdir.glob("*") if f.is_file() and f.suffix != ".pub"
                   and f.name not in ("config", "known_hosts", "known_hosts.old", "authorized_keys", "environment"))
-    out.print("  The agent never sees [cyan]~/.ssh[/].  Its [bold]ssh[/] is brokered: the real ssh runs outside the\n"
-              "  sandbox with a private ssh-agent holding one key.  Keys found: "
+    out.print("  [bold]ssh[/]: one key in a private ssh-agent.  Keys found: "
               + (", ".join(f"[bold]{k}[/]" for k in keys) if keys else "[dim]none[/]"))
-    key = ask("  key to load (empty = no ssh in the sandbox):", default=cfg["ssh_key"], words=keys)
-    if key and not (sshdir / key).exists():
-        die(f"~/.ssh/{key} not found")
+    while (key := ask("  key to load (empty = no ssh):", default=cfg["ssh_key"], words=keys)) \
+            and not (sshdir / key).exists():
+        err.print(f"    [yellow]~/.ssh/{key} not found[/]")
     cfg["ssh_key"] = key
     hosts_in_cfg = []
     if key and (sshdir / "config").exists():
-        cfg["ssh_config"] = click.confirm("  let brokered ssh use your ~/.ssh/config (aliases, ProxyJump...)?"
-                                          " The agent still can't read it.", default=cfg["ssh_config"])
+        cfg["ssh_config"] = click.confirm("  use your ~/.ssh/config for those connections (aliases, ProxyJump)?",
+                                          default=cfg["ssh_config"])
         if cfg["ssh_config"]:
             hosts_in_cfg = sorted({h for line in (sshdir / "config").read_text().splitlines()
                                    if line.strip().lower().startswith("host ")
@@ -561,49 +748,52 @@ def init():
     else:
         cfg["ssh_config"] = False
     if key:
-        out.print("  Allowed destinations (Tab completes your config's hosts, globs ok, empty line ends;"
-                  " none = any host).")
-        hosts = [h for h in cfg["ssh_hosts"] if click.confirm(f"  keep {h}?", default=True)]
+        out.print("  allowed destinations (Tab completes your config's hosts, globs ok; none = any host):")
+        hosts = keep_list(cfg["ssh_hosts"], "keep")
         while h := ask("  allow host:", words=hosts_in_cfg):
             hosts.append(h)
         cfg["ssh_hosts"] = hosts
+    else:
+        cfg["ssh_hosts"] = []
+    cfg["gpg"] = click.confirm("  [gpg] sign/decrypt through your gpg-agent (secret keys stay in the agent)?",
+                               default=cfg["gpg"])
+    if shutil.which("gh"):
+        keep = click.confirm("  [gh] run allowlisted gh subcommands (pr, issue, run, ...) on the host?",
+                             default=bool(cfg["brokered"].get("gh")))
+        cfg["brokered"] = {**cfg["brokered"], "gh": cfg["brokered"].get("gh") or DEFAULTS["brokered"]["gh"]} \
+            if keep else {k: v for k, v in cfg["brokered"].items() if k != "gh"}
 
     out.rule("[bold]4. Hidden paths[/]")
-    out.print("  Your home is readable (read-only) in the sandbox, except these.  Every tool's login files and\n"
-              "  other silo profiles are always hidden.  Tab completes paths, empty line ends.")
-    hidden = [h for h in cfg["hidden"] if click.confirm(f"  keep hiding {h}?", default=True)]
-    while h := ask("  hide path:", paths=True):
-        hidden.append(h.replace(str(HOME), "~", 1) if h.startswith(str(HOME)) else h)
-    cfg["hidden"] = hidden
+    cfg["hidden"] = path_list("  Masked even inside the paths above (every login and other profile always is).\n"
+                              "  [bold]Hidden paths[/] (empty line ends):", cfg["hidden"], "keep hiding", "hide path:")
 
     out.rule("[bold]5. Resources[/]")
     out.print("  Applied to the sandbox and everything it starts, background agents included.")
-    cfg["nice"] = int(ask("  CPU nice, 0 (normal) to 19 (lowest):", default=str(cfg["nice"])) or 0)
-    cfg["ionice"] = ask("  IO priority, idle / low / normal:", default=cfg["ionice"], words=list(IONICE))
-    if cfg["ionice"] not in IONICE:
-        die("IO priority must be idle, low or normal")
+    cfg["nice"] = number("  CPU nice, 0 (normal) to 19 (lowest):", cfg["nice"], 0, 19)
+    cfg["ionice"] = choose("  IO priority", list(IONICE), cfg["ionice"])
     cfg["memory_max"] = ask("  memory limit, e.g. 8G or 50% (empty = none):", default=cfg["memory_max"])
-    if cfg["memory_max"]:
-        cfg["swap_max"] = ask("  swap limit, e.g. 0 or 2G (empty = no limit):", default=cfg["swap_max"])
+    cfg["swap_max"] = ask("  swap limit, e.g. 0 or 2G (empty = none):", default=cfg["swap_max"]) \
+        if cfg["memory_max"] else ""
 
     out.rule("[bold]6. Updates[/]")
-    cfg["check_updates"] = ask("  check GitHub daily for a new silo? ask = tell me, always = install, never:",
-                               default=cfg["check_updates"], words=["ask", "always", "never"])
-    if cfg["check_updates"] not in ("ask", "always", "never"):
-        die("check_updates must be ask, always or never")
+    out.print("  silo can check GitHub for a new version, at most once a day, after commands like [cyan]ls[/].\n"
+              "  [bold]ask[/] = print a hint   [bold]always[/] = install it   [bold]never[/] = stay offline")
+    cfg["check_updates"] = choose("  automatic update checks", ["ask", "always", "never"], cfg["check_updates"])
 
-    ROOT.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    save_cfg(cfg)
     t = Table(box=None, show_header=False, padding=(0, 2))
-    t.add_row("writable", ", ".join(cfg["writable"]) or "[dim]-[/]")
-    t.add_row("ssh key", cfg["ssh_key"] or "[dim]none[/]")
-    t.add_row("ssh config", "yes" if cfg["ssh_config"] else "no")
+    t.add_row("writable", ", ".join(cfg["writable"]) or "[dim]cwd + profile only[/]")
+    t.add_row("readable", ", ".join(cfg["readable"] + (["PATH dirs"] if cfg["path_dirs"] else [])
+                                    + (["git config"] if cfg["git_config"] else [])) or "[dim]-[/]")
+    t.add_row("ssh", (f"{cfg['ssh_key']} → " + (", ".join(cfg["ssh_hosts"]) or "[yellow]any host[/]"))
+              if cfg["ssh_key"] else "[dim]off[/]")
+    t.add_row("gpg", "via agent" if cfg["gpg"] else "[dim]off[/]")
+    t.add_row("gh", f"{len(cfg['brokered']['gh'])} subcommands" if cfg["brokered"].get("gh") else "[dim]off[/]")
     t.add_row("hidden", f"{len(cfg['hidden'])} paths + all logins")
     t.add_row("resources", f"nice {cfg['nice']}, io {cfg['ionice']}, memory {cfg['memory_max'] or 'unlimited'}"
                            + (f", swap {cfg['swap_max']}" if cfg["swap_max"] else ""))
     t.add_row("updates", cfg["check_updates"])
-    t.add_row("ssh hosts", ", ".join(cfg["ssh_hosts"]) or ("[yellow]any[/]" if cfg["ssh_key"] else "[dim]-[/]"))
-    out.print(Panel(t, title="saved", border_style="green"))
+    out.print(Panel(t, title=f"saved  (config v{CONFIG_VERSION})", border_style="green"))
     ok(f"done - try [cyan]{Path(sys.argv[0]).name} ls -a[/]")
 
 
@@ -695,16 +885,13 @@ CHOICES = {"ionice": ["idle", "low", "normal"], "check_updates": ["ask", "always
 
 
 def raw_cfg():
-    try:
-        return json.loads(CONFIG.read_text())
-    except OSError:
-        return {}
-    except ValueError as e:
-        die(f"{CONFIG} is not valid JSON: {e}")
+    return read_cfg()
 
 
 def coerce(key, values):
     d = DEFAULTS[key]
+    if isinstance(d, dict):
+        die(f"{key} is a table; change it with [cyan]silo config --edit[/]")
     if isinstance(d, list):
         return [v.replace(str(HOME), "~", 1) if v.startswith(str(HOME)) else v for v in values]
     if len(values) != 1:
@@ -728,6 +915,8 @@ def coerce(key, values):
 
 
 def show(v):
+    if isinstance(v, dict):
+        return "; ".join(f"{k}: {', '.join(x)}" for k, x in v.items()) or "[dim](none)[/]"
     if isinstance(v, list):
         return ", ".join(v) if v else "[dim](none)[/]"
     if isinstance(v, bool):
@@ -747,8 +936,7 @@ def config(key, values, add, drop, unset, edit):
     raw = raw_cfg()
     if edit:
         if not CONFIG.exists():
-            CONFIG.parent.mkdir(parents=True, exist_ok=True)
-            CONFIG.write_text(json.dumps(DEFAULTS, indent=2) + "\n")
+            save_cfg(dict(DEFAULTS))
         click.edit(filename=str(CONFIG))
         raw_cfg()                                       # validate
         return ok(f"saved {CONFIG}")
@@ -759,7 +947,8 @@ def config(key, values, add, drop, unset, edit):
         for k, d in DEFAULTS.items():
             t.add_row(f"[bold green]{k}[/]", show(raw.get(k, d)), "" if k in raw else "[dim]default[/]")
         out.print(t)
-        return out.print(f"[dim]{CONFIG}  -  silo config KEY VALUE  /  --add / --drop / --unset / --edit[/]")
+        return out.print(f"[dim]{CONFIG}  (config v{raw.get('config_version', CONFIG_VERSION)})"
+                         f"  -  silo config KEY VALUE  /  --add / --drop / --unset / --edit[/]")
     if key not in DEFAULTS:
         die(f"unknown setting [bold]{key}[/]; one of: {', '.join(DEFAULTS)}")
     if unset:
@@ -777,8 +966,7 @@ def config(key, values, add, drop, unset, edit):
         return out.print(show(raw.get(key, DEFAULTS[key])))
     if key == "ssh_key" and raw.get(key) and not (HOME / ".ssh" / raw[key]).exists():
         die(f"~/.ssh/{raw[key]} not found")
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(raw, indent=2) + "\n")
+    save_cfg(raw)
     ok(f"{key} = {show(raw.get(key, DEFAULTS[key]))}")
 
 

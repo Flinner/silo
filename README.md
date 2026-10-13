@@ -5,7 +5,7 @@
 **One Python file. Many accounts. Every agent CLI in its own bubblewrap sandbox.**
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue)](https://github.com/flinner/silo/blob/main/silo)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue)](https://github.com/flinner/silo/blob/main/silo)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Sandbox](https://img.shields.io/badge/sandbox-bubblewrap-orange)](https://github.com/containers/bubblewrap)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey)](#limitations)
@@ -15,7 +15,7 @@
 [Quick start](#quick-start) ·
 [Commands](#commands) ·
 [Configuration](#configuration) ·
-[SSH](#ssh-without-keys-in-the-sandbox) ·
+[Brokers](#brokered-access-ssh-gpg-gh) ·
 [How it works](#how-it-works) ·
 [Limitations](#limitations)
 
@@ -40,11 +40,11 @@ $ silo-codex main           # codex, same sandbox rules
 `CODEX_HOME`, so accounts never overwrite each other's logins and any number
 run side by side. Every run is wrapped in [bubblewrap](https://github.com/containers/bubblewrap):
 
-- your home is **read-only**, and logins, other profiles, `gh`/git/cloud
-  credentials are **not there at all**;
-- only the working directory, the profile, and paths you choose are writable;
-- `ssh` works, but **`~/.ssh` is empty** — connections are brokered to the
-  host with one key and a host allowlist.
+- your home is **empty** — only the working directory, the profile and paths
+  you choose exist, plus your tools and git identity read-only;
+- logins, other profiles and secrets are **never there**, not even read-only;
+- `ssh`, `gpg` and `gh` work, but through **brokers on the host**: the agent
+  uses your keys and tokens without ever being able to read them.
 
 ## Why?
 
@@ -56,8 +56,8 @@ with no root, no containers and no daemon of its own:
 |---|---|
 | **No sudo, ever** | Unprivileged user namespaces via `bwrap`. Nothing to install system-wide beyond the packages below. |
 | **Accounts side by side** | One config dir per profile. `silo work` and `silo main` run concurrently; claude sessions in different profiles can still list and message each other. |
-| **Secrets stay out** | Every tool's login files (all accounts), other profiles, and a configurable list (`~/.config/gh`, `~/.gnupg`, `~/.aws`, ...) are masked inside the sandbox. |
-| **ssh without keys** | The agent can `ssh`, `scp` and `git push` to hosts you allow; it can never read the key or your ssh config. |
+| **Empty home** | The sandbox starts from an empty home. You map back what the agent needs; everything else, from browser profiles to `~/.aws`, simply isn't there. |
+| **Brokered keys** | `ssh`/`scp`/`git push` to hosts you allow, `gpg` signing through your agent, allowlisted `gh` subcommands with your token — none of the secrets enter the sandbox. |
 | **Polite by default** | Runs at `nice 10` and idle IO priority; an optional memory cap (a systemd user scope) covers the agent and everything it spawns. |
 | **Long-lived agents work** | Background agents (`--bg`), their daemon and Remote Control keep working across runs. |
 | **Any CLI** | claude and codex are built in; another agent CLI is one table entry. |
@@ -98,19 +98,23 @@ Normal commands check at most once a day — configurable with
 ## Quick start
 
 ```bash
-silo init                     # onboarding: import logins, writable paths, ssh key, hidden paths
+silo init                     # onboarding: logins, filesystem, brokers, limits, updates
 silo ls -a                    # see the profiles
 silo new work                 # a fresh profile ...
 silo work auth login          # ... and log it in (codex: silo-codex work login)
 silo work                     # run claude as 'work'
 ```
 
-`silo init` scans what you already have: if claude or codex is logged in, it
-offers to import that login as a profile. It then asks which extra paths
-should be writable (Tab completes paths), which ssh key to load, which hosts
-to allow, which secrets to hide, CPU/IO priority and memory limit, and how to
-handle updates. Re-run it any time;
-Enter keeps the current answer.
+`silo init` walks through six steps: **logins** (if claude or codex is logged
+in, import it as a profile), **filesystem** (extra writable and read-only paths,
+your PATH tools, git config), **brokered access** (ssh key and allowed hosts,
+gpg, gh), **hidden paths**, **resources** (nice, IO priority, memory) and
+**updates** (whether to check automatically). Tab completes paths, keys and
+hosts; Enter keeps the current answer; bad answers are asked again. Change a
+single setting later with `silo config KEY VALUE`.
+
+silo refuses to run from your home directory itself, since the working
+directory is mounted read-write. Run it from a project directory.
 
 ## Commands
 
@@ -142,7 +146,14 @@ $ silo config --edit              # or open the JSON in $EDITOR
 
 ```json
 {
+  "config_version": "1.0",
+  "silo_min_version": "0.4.0",
   "writable": ["~/code/tmp"],
+  "readable": ["~/datasets"],
+  "path_dirs": true,
+  "git_config": true,
+  "gpg": true,
+  "brokered": {"gh": ["pr", "issue", "run list", "run view", "repo view"]},
   "hidden": ["~/.config/gh", "~/.git-credentials", "~/.netrc", "~/.gnupg", "~/.aws"],
   "ssh_key": "id_ed25519",
   "ssh_config": true,
@@ -157,8 +168,13 @@ $ silo config --edit              # or open the JSON in $EDITOR
 
 | Key | Default | Meaning |
 |---|---|---|
-| `writable` | `[]` | Extra paths writable inside the sandbox (the cwd and the profile always are) |
-| `hidden` | common secret paths | Masked inside the sandbox, on top of every tool's login files |
+| `writable` | `[]` | Extra read-write paths (the cwd and the profile always are) |
+| `readable` | `[]` | Extra read-only paths |
+| `path_dirs` | `true` | Expose the `PATH` directories under your home (your installed tools), read-only |
+| `git_config` | `true` | Expose `~/.gitconfig` and `~/.config/git`, read-only |
+| `gpg` | `false` | Sign/decrypt through your gpg-agent's restricted socket |
+| `brokered` | `gh`: common subcommands | Commands run on the host, by allowed subcommand prefix |
+| `hidden` | common secret paths | Masked even inside mapped paths, on top of every tool's login files |
 | `ssh_key` | `""` | Key in `~/.ssh` loaded into the profile's private ssh-agent; empty = no ssh |
 | `ssh_config` | `false` | Let brokered ssh use your `~/.ssh/config` (identity lines stripped) |
 | `ssh_hosts` | `[]` | Allowed ssh destinations, globs ok; empty = any host |
@@ -169,10 +185,19 @@ $ silo config --edit              # or open the JSON in $EDITOR
 | `check_updates` | `ask` | `ask` \| `always` \| `never` |
 
 Environment overrides: `SILO_ROOT` (default `~/.config/silo`), `SILO_SSH_KEY`.
+They apply to one run and are never written to the file.
 
-## SSH without keys in the sandbox
+**Versioned.** The file records `config_version` and `silo_min_version`, the
+oldest silo that understands it. An older silo refuses a config that needs a
+newer release (and says `silo update`), refuses a newer major config version,
+and only warns on a newer minor one. Configs from before versioning load as-is
+and are stamped on the next save.
 
-Inside the sandbox `~/.ssh` is an empty directory and `/usr/bin/ssh` is a
+## Brokered access: ssh, gpg, gh
+
+### ssh
+
+Inside the sandbox `~/.ssh` does not exist and `/usr/bin/ssh` is a
 dozen-line shim. It hands its arguments and its stdin/stdout/stderr (the actual
 file descriptors, so interactive terminals work) to a broker running on the
 host, which:
@@ -189,6 +214,25 @@ host, which:
 `scp`, `rsync -e ssh` and `git` over ssh go through the same shim. The private
 key never enters the sandbox; the agent can use it only against hosts you allow.
 
+### gpg
+
+With `gpg` on, the profile gets its own `GNUPGHOME` holding **public keys and
+ownertrust only**, copied from your keyring on each run. Its agent socket is
+your gpg-agent's `extra` socket, the restricted socket gpg provides for
+forwarding: it can sign and decrypt, prompts with pinentry **on the host**, and
+cannot export or change secret keys. Signed git commits work as usual.
+
+### gh and other commands
+
+`brokered` maps a command to allowed subcommand prefixes. The command's shim
+sends its arguments, working directory and terminal to the host broker, which
+runs the real `gh` with your login. A call is refused unless it matches a
+prefix (`gh pr create` matches `pr`; `gh auth token` and `gh api` match
+nothing by default) **and** the working directory is inside the sandbox's
+writable paths. The token in `~/.config/gh` is hidden from the sandbox.
+
+Git over **https** has no broker: use ssh remotes (brokered above) or `gh`.
+
 ## How it works
 
 ```
@@ -200,8 +244,8 @@ key never enters the sandbox; the agent can use it only against hosts you allow.
 │                               │            │                                  │
 │ ssh broker (per profile)      │ ◄───────── │ /usr/bin/ssh  = shim             │
 │  · vets argv, runs real ssh   │  unix sock │ ~/.ssh        = empty            │
-│  · ssh-agent with ONE key     │  + fds     │ / and ~       = read-only        │
-│                               │            │ logins, secrets = masked         │
+│  · ssh-agent with ONE key     │  + fds     │ /             = read-only        │
+│  · gh with your token         │            │ ~             = empty tmpfs      │
 │ $XDG_RUNTIME_DIR (hidden)     │            │ cwd, profile, writable = rw      │
 │ host ssh-agent, dbus (hidden) │            │ /tmp = NAME/tmp (persistent)     │
 └───────────────────────────────┘            └──────────────────────────────────┘
@@ -215,9 +259,12 @@ skills), so edits to those apply everywhere.
 **Mount layout.** `/` is bound read-only; `/tmp` is the profile's own
 persistent directory; `$XDG_RUNTIME_DIR` is replaced by an empty tmpfs (it
 holds the host ssh-agent, the session bus and editor/terminal servers — all
-ways out); `~/.config/silo` is masked except the active profile; secrets are
-masked with `/dev/null` or an empty tmpfs; then the working directory, the
-profile and your `writable` paths are bound read-write.
+ways out); your home is replaced by an empty tmpfs. Mapped back read-only: your
+`readable` paths, the `PATH` directories under your home, git config, the
+tool's own binary and claude's shared instructions. Mapped back read-write: the
+working directory, the profile and your `writable` paths. Finally every login
+file and `hidden` path inside anything mapped back is masked. Writes elsewhere
+in home land in the tmpfs and vanish when the run ends.
 
 **Resource limits.** `silo` execs `systemd-run --user --scope` (when a memory
 limit is set), then `nice` and `ionice`, then `bwrap`. Limits are inherited, so
@@ -244,8 +291,9 @@ its login files, and how to read the account email.
 - The network namespace is shared (agents need the network), so abstract
   unix sockets such as X11's remain reachable.
 - Window resizes are not forwarded to brokered interactive ssh sessions.
-- Your home is readable except the hidden paths; add anything sensitive to
-  `hidden`.
+- Everything under a mapped-back path is visible, so check what your
+  `readable`/`writable` paths and the PATH directories under your home contain.
+- Git over https has no credential broker; use ssh remotes or `gh`.
 - `--shell` must be the only argument after the profile name.
 
 ## License

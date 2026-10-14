@@ -1238,9 +1238,8 @@ def _plan_line(key, status, ends, label_end):
     name, price = PRICES.get(key, (key.replace("_", " ").title() if key else "?", None))
     bits = [name, f"~${price}/mo list" if price else None, status]
     if ends:
-        sep = "" if label_end.endswith("~") else " "
-        bits.append(f"{label_end}{sep}{_date(ends)}" if ends > time.time()
-                    else f"[yellow]{label_end}{sep}{_date(ends)} (stale; a run refreshes it)[/]")
+        bits.append(f"{label_end} {_date(ends)}" if ends > time.time()
+                    else f"[yellow]{label_end} {_date(ends)} (stale; a run refreshes it)[/]")
     return " · ".join(b for b in bits if b)
 
 
@@ -1251,16 +1250,11 @@ def claude_plan(d):
     o = get_json("https://api.anthropic.com/api/oauth/profile",
                  {"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"}).get("organization") or {}
     key = o.get("rate_limit_tier") if o.get("rate_limit_tier") in PRICES else o.get("organization_type", "")
-    renew = None
-    if o.get("billing_type") == "stripe_subscription" and o.get("subscription_created_at"):
-        from datetime import datetime    # monthly anniversary of the start: an estimate, the API has no renewal date
-        st = datetime.fromisoformat(o["subscription_created_at"].replace("Z", "+00:00"))
-        now = datetime.now(st.tzinfo)
-        m = now.year * 12 + now.month - 1 + (now.day >= st.day)
-        renew = st.replace(year=m // 12, month=m % 12 + 1, day=min(st.day, 28)).timestamp()
     status = o.get("subscription_status")
     trial = o.get("claude_code_trial_ends_at")
-    line = _plan_line(key, None if status == "active" else status, renew, "renews ~")
+    line = _plan_line(key, None if status == "active" else status, None, "")
+    if o.get("subscription_created_at"):    # the API has no billing period or renewal date
+        line += f" · since {_date(_epoch(o['subscription_created_at']))}"
     return line + (f" · trial ends {_date(_epoch(trial))}" if trial else "")
 
 

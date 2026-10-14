@@ -1,6 +1,6 @@
 <div align="center">
 
-![silo — every AI coding agent in its own sandbox, under its own account](assets/banner.png)
+![silo — many accounts, any history, every agent CLI sandboxed with bubblewrap](assets/banner.png)
 
 **One Python file. Accounts and histories mixed freely. Every agent CLI in its own bubblewrap sandbox.**
 
@@ -115,13 +115,24 @@ silo status -a                      # 5h / weekly / per-model limits of every lo
 
 ```console
 $ silo status -a
-  Tool      Login    Account               Window      Used               Resets in
-  claude    main     me@university.edu     5h          ███░░░░░░░  27%    2h 39m
-                                           7d          █████████░  91%    5d 19h
-                                           7d Opus     ██████████ 100%    5d 19h
-  codex     main     me@example.org        5h          ░░░░░░░░░░   0%    4h 59m
-                                           7d          █░░░░░░░░░  12%    5d 23h
+main claude  me@university.edu
+  5h        ▀▀▀▀▀▀▀▀▀▀▀▀▀▀  29%  slow -22%               2h 27m
+  7d        ▀▀▀▀▀▀▀▀▀▀▀▀▀▀  80%  fast +64% · out in 1d   5d 19h
+  7d Opus   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀ 100%  used up                 5d 19h
+main codex  me@example.org
+  5h        ▀▀▀▀▀▀▀▀▀▀▀▀▀▀   0%  new window              4h 59m
+  7d        ▀▀▀▀▀▀▀▀▀▀▀▀▀▀  12%  on pace                 5d 23h
+bars: top = used, bottom = time gone
 ```
+
+Each bar is two in one row of half blocks: the top half (green, yellow, red)
+is how much you have used, the bottom half (grey) how much of the window has
+passed — a top bar running ahead of the bottom one means you are fast.
+The pace column compares the two (within 10
+points is "on pace") and, when you are fast, says when the limit runs out at
+your average rate so far. One heading per login and a bar that shrinks with the
+terminal keep it readable in a narrow window. Answers are cached for a minute;
+when the endpoint rate-limits, the last answer is shown with its age.
 
 `status` asks the same endpoints claude's `/usage` and codex's limit display
 use. It never refreshes a token (that would race the tool's own refresh); an

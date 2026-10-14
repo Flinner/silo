@@ -1189,6 +1189,9 @@ def get_json(url, headers):
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
+        if e.code == 429:
+            wait = e.headers.get("Retry-After")
+            raise RuntimeError(f"HTTP 429: rate limited, try again {f'in {wait}s' if wait else 'in a minute'}")
         raise RuntimeError("token expired; any run refreshes it" if e.code == 401 else f"HTTP {e.code}")
     except (OSError, ValueError) as e:
         raise RuntimeError(str(e))
@@ -1209,13 +1212,15 @@ def claude_usage(d):
             model = ((l.get("scope") or {}).get("model") or {}).get("display_name")
             win = {"session": "5h", "weekly": "7d"}.get(l.get("group"), l.get("group") or l.get("kind") or "?")
             rows.append((f"{win} {model}" if model else win, float(l.get("percent") or 0),
-                         _epoch(l["resets_at"]) if l.get("resets_at") else None))
+                         _epoch(l["resets_at"]) if l.get("resets_at") else None, WINDOW_SECS.get(win)))
         return rows
     names = {"five_hour": "5h", "seven_day": "7d", "seven_day_opus": "7d Opus", "seven_day_sonnet": "7d Sonnet"}
-    return [(label, float(v["utilization"]), _epoch(v["resets_at"]) if v.get("resets_at") else None)
+    return [(label, float(v["utilization"]), _epoch(v["resets_at"]) if v.get("resets_at") else None,
+             WINDOW_SECS[label[:2]])
             for k, label in names.items() if isinstance(v := data.get(k), dict) and v.get("utilization") is not None]
 
 
+WINDOW_SECS = {"5h": 5 * 3600, "7d": 7 * 86400}
 CLAUDE_OAUTH = ("https://platform.claude.com/v1/oauth/token", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
 
 
@@ -1264,7 +1269,7 @@ def codex_usage(d):
                 win = f"{secs // 86400}d" if secs and secs % 86400 == 0 else f"{secs // 3600}h" if secs else "?"
                 rows.append(((name + " " if name else "") + win, float(o["used_percent"]),
                              o.get("reset_at") or (time.time() + o["reset_after_seconds"]
-                                                   if o.get("reset_after_seconds") else None)))
+                                                   if o.get("reset_after_seconds") else None), secs or None))
                 return
             name = o.get("limit_name") or o.get("metered_feature") or name
             for k, v in o.items():
@@ -1291,10 +1296,42 @@ def _until(ts):
     return f"{d}d {h}h" if d else f"{h}h {m:02d}m" if h else f"{m}m"
 
 
-def _bar(p, w=10):
+def _elapsed(reset, length):
+    """fraction of the window gone, or None when the window is unknown."""
+    if not (reset and length):
+        return None
+    return min(1.0, max(0.0, 1 - (reset - time.time()) / length))
+
+
+def _bar(p, el, w=14):
+    """two bars in one row of half blocks: usage on top, time gone underneath."""
     n = round(min(p, 100) / 100 * w)
+    t = round(el * w) if el is not None else 0
     c = "red" if p >= 90 else "yellow" if p >= 70 else "green"
-    return f"[{c}]{'█' * n}[/][dim]{'░' * (w - n)}[/] {p:3.0f}%"
+    cells = []
+    for i in range(w):
+        top = c if i < n else "grey23"
+        bot = "grey62" if i < t else "grey23"
+        cells.append(f"[{top} on {bot}]▀[/]")
+    return "".join(cells) + f" {p:3.0f}%"
+
+
+def _pace(p, el, reset, length):
+    """how usage compares with the time gone, and when it runs out at this rate."""
+    if el is None:
+        return "[dim]-[/]"
+    if p >= 100:
+        return "[red]used up[/]"
+    if el < 0.02:
+        return "[dim]new window[/]"
+    d = p - el * 100
+    tag = (f"[red]fast +{d:.0f}%[/]" if d > 10 else f"[green]slow {d:.0f}%[/]" if d < -10
+           else "[cyan]on pace[/]")
+    if p > 0:
+        out_at = time.time() + (100 - p) * el * length / p     # at the average rate so far
+        if out_at < reset:
+            tag += f" [red]· out in {_until(out_at)}[/]"
+    return tag
 
 
 @cli.command()
@@ -1318,27 +1355,46 @@ def status(tool, every):
         return out.print("[dim]no logins yet - try[/] login add NAME --current")
     res = [None] * len(jobs)
 
-    def fetch(i, tl, d):
+    age = [None] * len(jobs)
+
+    def fetch(i, tl, d):   # cached a minute; when the endpoint refuses (e.g. 429), the last answer
+        f = STATE / "usage" / f"{tl.bin}-{jobs[i][1]}.json"
+        cache = json_file(f)
+        if cache and time.time() - cache["at"] < 60:
+            res[i] = [tuple(x) for x in cache["rows"]]
+            return
         try:
             res[i] = tl.usage(d)
+            f.parent.mkdir(parents=True, exist_ok=True)
+            write_json(f, {"at": time.time(), "rows": res[i]})
         except RuntimeError as e:
-            res[i] = str(e)
+            res[i] = [tuple(x) for x in cache["rows"]] if cache and "HTTP" in str(e) else str(e)
+            age[i] = cache and time.time() - cache["at"]
     th = [threading.Thread(target=fetch, args=(i, j[0], j[2])) for i, j in enumerate(jobs)]
     with out.status("asking for usage ..."):
         for t in th:
             t.start()
         for t in th:
             t.join()
-    t = Table(box=None, padding=(0, 2), header_style="bold")
-    for c in ("Tool", "Login", "Account", "Window", "Used", "Resets in"):
-        t.add_column(c)
-    for (tl, name, d), r in zip(jobs, res):
-        head = [f"[dim]{tl.bin}[/]", f"[bold]{name}[/]", (tl.email and tl.email(d)) or "[dim]-[/]"]
+    # one heading per login, then a short row per window: fits narrow terminals (the bar shrinks)
+    w = max(5, min(20, out.width - 54))
+    for (tl, name, d), r, a in zip(jobs, res, age):
+        email = (tl.email and tl.email(d)) or ""
+        stale = f"  [yellow](from {_until(time.time() + a)} ago)[/]" if a and isinstance(r, list) else ""
+        out.print(f"[bold]{name}[/] [dim]{tl.bin}  {email}[/]{stale}", overflow="ellipsis", no_wrap=True)
         if isinstance(r, str) or not r:
-            t.add_row(*head, "", f"[yellow]{r or 'no limits reported'}[/]", "")
-        for i, (win, p, reset) in enumerate(r if isinstance(r, list) else []):
-            t.add_row(*(head if i == 0 else ["", "", ""]), win, _bar(p), _until(reset))
-    out.print(t)
+            out.print(f"  [yellow]{r or 'no limits reported'}[/]")
+            continue
+        t = Table(box=None, padding=(0, 1), show_header=False, pad_edge=False)
+        t.add_column(no_wrap=True)
+        t.add_column(no_wrap=True)
+        t.add_column(no_wrap=True, overflow="ellipsis")
+        t.add_column(no_wrap=True, justify="right", min_width=6)
+        for win, p, reset, length in r:
+            el = _elapsed(reset, length)
+            t.add_row(f"  {win}", _bar(p, el, w), _pace(p, el, reset, length), _until(reset))
+        out.print(t)
+    out.print("[dim]bars: top = used, bottom = time gone[/]")
 
 
 @cli.command("check-update")

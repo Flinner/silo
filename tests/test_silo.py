@@ -237,7 +237,7 @@ class SiloTest(unittest.TestCase):
             with patch.object(S['subprocess'], 'run') as run:
                 run.return_value.returncode = 0
                 self.ui().run_agent(self.tool, 'research', 'work')
-                run.assert_called_once_with(['nice', 'bwrap', 'research', 'work', 'claude'])
+                run.assert_called_once_with(['nice', 'bwrap', 'research', 'work', 'claude'], close_fds=False)
             with patch.object(S['os'], 'execvp') as execute:
                 self.invoke(['claude', '--profile=research', '--login=work', '-c'])
                 execute.assert_called_once_with('nice', ['nice', 'bwrap', 'research', 'work', 'claude', '-c'])

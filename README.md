@@ -2,7 +2,7 @@
 
 ![silo — many accounts, any history, every agent CLI sandboxed with bubblewrap](assets/banner-v2.png)
 
-**One Python file. Accounts and histories mixed freely. Every agent CLI in its own bubblewrap sandbox.**
+**One Python file. A simple terminal menu for accounts, histories and settings. Every agent CLI in its own bubblewrap sandbox.**
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Version](https://img.shields.io/badge/version-0.6.0-blue)](https://github.com/flinner/silo/blob/main/silo)
@@ -13,6 +13,7 @@
 
 [Install](#install) ·
 [Quick start](#quick-start) ·
+[Terminal menu](#terminal-menu) ·
 [Commands](#commands) ·
 [Configuration](#configuration) ·
 [Brokers](#brokered-access-ssh-gpg-gh) ·
@@ -101,16 +102,17 @@ Normal commands check at most once a day — configurable with
 
 ## Quick start
 
+Run `silo` to open the menu, press `n` to create a profile, and choose
+Claude or Codex. Pick an existing account or create and authenticate a new one.
+Select the profile, then **Launch**.
+
+Direct commands remain available:
+
 ```bash
-silo init                     # onboarding: logins, filesystem, brokers, limits, updates
-silo ls -a                    # see the profiles
-silo new work                 # a fresh profile, with its own login 'work' ...
-silo work auth login          # ... logged in (codex: silo-codex work login)
-silo work                     # run claude as 'work'
-silo new research --login main      # another history on an existing login
-silo work --login main              # this run only: work's history, main's account
-silo login use work main            # from now on
-silo status -a                      # 5h / weekly / per-model limits of every login
+silo claude --profile=work --login=work
+silo codex --profile=research --login=main
+silo claude --profile=research --login=main -c
+silo status -a
 ```
 
 ```console
@@ -148,7 +150,7 @@ expired one says so, and the next run of any profile with that login renews it.
 
 `silo init` walks through six steps: **logins** (if claude or codex is logged
 in, import it as a login, with a profile of the same name if none exists), **filesystem** (extra writable and read-only paths,
-your PATH tools, git config), **brokered access** (ssh key and allowed hosts,
+your PATH tools, git config), **brokered access** (SSH key names and allowed hosts,
 gpg, gh), **hidden paths**, **resources** (nice, IO priority, memory) and
 **updates** (whether to check automatically). Tab completes paths, keys and
 hosts; Enter keeps the current answer; bad answers are asked again. Change a
@@ -157,20 +159,69 @@ single setting later with `silo config KEY VALUE`.
 silo refuses to run from your home directory itself, since the working
 directory is mounted read-write. Run it from a project directory.
 
+## Terminal menu
+
+Run `silo` or `silo tui` in an interactive terminal. The menu uses Python's
+built-in `curses`; no additional package is needed. `silo codex tui` puts
+Codex profiles first.
+
+- **Profiles:** arrow keys select, Enter opens launch and management actions.
+  Press `n` for a guided creation flow. Change the login for one launch or
+  save it as the profile's default, authenticate, rename, or delete a profile.
+- **Logins:** press `l` to add, authenticate, import this machine's account,
+  or delete an account. An account that profiles default to cannot be deleted.
+- **Settings:** press `s` to edit every supported setting. Booleans and choices
+  use menus; paths and permissions use editable lists and tables. Press `s`
+  to save, `r` to reset one setting, or `R` to reset all. Escape cancels;
+  unsaved changes require confirmation before being discarded.
+
+Press Escape to go back or `q` on Profiles to quit. Authentication and agent
+launches use the normal terminal; press Enter after they finish to return to
+the menu. Deleting a profile removes its history and keeps its account.
+
+Settings use the same schema, defaults and validation as `silo config` and
+`init`. Saves are atomic, preserve unknown configuration fields, and detect
+conflicting edits made while the settings menu is open. Environment overrides
+apply to agent launches and are not written into the configuration file.
+
 ## Commands
+
+Run `silo [claude|codex] [--profile NAME] [--login NAME] [TOOL ARGS...]`.
+Both `--profile=NAME` and `--login=NAME` also work.
+The tool defaults to Claude. The profile defaults to the login name, or `main`
+when neither flag is given. The login defaults to the profile's saved account
+(or its own name); `--login` overrides it for this launch. For example:
+
+```sh
+silo                              # open the terminal menu
+silo codex                        # Codex, main account and history
+silo claude --login work          # work account and history
+silo claude --profile research --login main -c
+silo codex --profile research --login work exec 'review changes'
+```
+
+When using named flags, agent arguments pass through directly. Use `--` to
+pass a literal `--login` or `--profile` flag to the agent. The login and history
+must already exist (`login add` / `new`).
+Management commands also accept a tool prefix, such as `silo codex ls` or
+`silo codex new research --login work`. Existing profile-first commands and
+`--tool` remain supported.
 
 | Command | Does |
 |---|---|
+| `tui` / no arguments | Open profiles, login management and all settings in a terminal menu |
 | `init` | Interactive onboarding; writes `~/.config/silo/config.json` |
 | `config [KEY [VALUE...]]` | Show all settings, read one, or set one (`--add` / `--drop` for lists, `--unset`, `--edit`) |
 | `ls [-a]` | Profiles of the selected tool (`-a`: all tools) with login, account and background-daemon state |
 | `new NAME [--login L] [--current]` | Create a profile using login `L` (default: `NAME`); `--current` imports this machine's current login as it |
+| `rename NAME NEW_NAME` | Rename a profile, keeping history and its default account |
 | `rm NAME [-y]` | Delete a profile, stopping its background agents and ssh broker first; its login is kept |
 | `login [ls [-a]]` | Logins, their accounts and the profiles that default to them |
 | `login add NAME [--current]` | Create an empty login (log in with `silo PROFILE --login NAME auth login`), or import the current one |
 | `login use PROFILE LOGIN` | Make `LOGIN` the default login of `PROFILE` |
 | `status [-a]` | Usage limits of every login: 5-hour, weekly and per-model windows, how much is used and when each resets |
 | `login rm NAME [-y]` | Delete a login (refused while a profile defaults to it) |
+| `claude\|codex [--profile NAME] [--login NAME] [ARGS...]` | Run an agent; omitted login uses the profile default |
 | `NAME [--login L] [ARGS...]` | Run the tool as profile `NAME` (with login `L` for this run); every other flag passes through (`silo work -c`, `silo work --bg '...'`) |
 | `NAME --shell` | A shell inside `NAME`'s sandbox, to see exactly what the agent sees |
 | `check-update` / `update` | Check for / install a newer silo |

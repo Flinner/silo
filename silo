@@ -3,6 +3,7 @@
 
 https://github.com/flinner/silo  -  MIT License
 """
+import copy, curses, tempfile, sqlite3, contextlib
 import base64, fnmatch, urllib.request, urllib.error, json, os, re, select, shutil, signal, socket, subprocess, sys, threading, time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +13,7 @@ try:
     from rich.console import Console
     from rich.table import Table
     from rich.panel import Panel
+    from rich.text import Text
 except ImportError as e:
     sys.exit(f"silo: missing Python package '{e.name}'. Install bubblewrap, click, rich and prompt_toolkit:\n"
              "  Arch:          sudo pacman -S bubblewrap python-click python-rich python-prompt_toolkit\n"
@@ -20,16 +22,18 @@ except ImportError as e:
 if not shutil.which("bwrap"):
     sys.exit("silo: bubblewrap (bwrap) is not installed; see https://github.com/flinner/silo#install")
 
-VERSION = "0.6.0"
+VERSION = "0.8.0"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/silo/main/silo"
 
 HOME = Path.home()
 ROOT = Path(os.environ.get("SILO_ROOT", HOME / ".config/silo"))  # ROOT/<tool>/<profile>
 LOGINS = ROOT / "logins"                                          # LOGINS/<tool>/<login>
 CONFIG = ROOT / "config.json"                                     # written by `init`
-DEFAULTS = {"ssh_keys": [], "ssh_config": False, "ssh_hosts": [], "writable": [], "check_updates": "ask",
+_defaults = {"ssh_keys": [], "ssh_config": False, "ssh_hosts": [], "writable": [], "check_updates": "ask",
             "nice": 10, "ionice": "idle", "memory_max": "", "swap_max": "",
             "readable": [], "path_dirs": True, "git_config": True, "gpg": False,
+            "onboarding_complete": False, "profile_settings": {},
+            "default_tool": "claude", "default_profiles": {}, "default_logins": {},
             "logins": {},   # "tool/profile": login, when it is not the profile's own name
             "brokered": {"gh": ["pr", "issue", "run list", "run view", "run watch", "run rerun",
                                 "run download", "workflow list", "workflow view", "workflow run",
@@ -37,6 +41,228 @@ DEFAULTS = {"ssh_keys": [], "ssh_config": False, "ssh_hosts": [], "writable": []
                                 "status", "browse", "label list"]},
             "hidden": ["~/.config/gh", "~/.git-credentials", "~/.netrc", "~/.gnupg", "~/.password-store",
                        "~/.aws", "~/.kube", "~/.docker/config.json", "~/.local/share/keyrings", "~/.pypirc"]}
+
+@dataclass(frozen=True)
+class Setting:
+    default: object
+    description: str
+    choices: tuple = ()
+    scope: str = "global"
+
+    def validate(self, key, value):
+        if type(value) is not type(self.default):
+            raise ValueError(f"{key} must be {type(self.default).__name__}")
+        if isinstance(value, list) and any(not isinstance(v, str) for v in value):
+            raise ValueError(f"{key} must contain only text")
+        if self.choices and value not in self.choices:
+            raise ValueError(f"{key}: choose {', '.join(self.choices)}")
+        if key == "nice" and not 0 <= value <= 19:
+            raise ValueError("nice must be between 0 and 19")
+        if key in ("memory_max", "swap_max") and value and not re.fullmatch(
+                r"(?:[0-9]+(?:\.[0-9]+)?[KMGTPE]?|[0-9]+%|infinity)", value):
+            raise ValueError(f"{key}: use a size like 4G, a percentage, infinity, or blank")
+        if key == "profile_settings":
+            for name, overrides in value.items():
+                if not isinstance(name, str) or len(name.split("/")) != 2 or name.split("/")[0] not in TOOLS:
+                    raise ValueError("profile_settings keys must be tool/profile")
+                validate_name(name.split("/")[1])
+                Configuration.validate_profile(overrides)
+        if key == "default_tool" and value not in TOOLS:
+            raise ValueError(f"unknown tool: {value}")
+        if key in ("default_profiles", "default_logins"):
+            for tool, name in value.items():
+                if tool not in TOOLS:
+                    raise ValueError(f"unknown tool: {tool}")
+                validate_name(name)
+        if key == "logins":
+            for name, login in value.items():
+                if not isinstance(name, str) or len(name.split("/")) != 2:
+                    raise ValueError("logins keys must be tool/profile")
+                tool, profile_name = name.split("/")
+                if tool not in TOOLS:
+                    raise ValueError(f"unknown tool: {tool}")
+                validate_name(profile_name)
+                validate_name(login)
+        if key == "brokered":
+            for command, allow in value.items():
+                if not isinstance(command, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]+", command):
+                    raise ValueError("brokered keys must be command names")
+                if not isinstance(allow, list) or any(not isinstance(v, str) or not v.strip() for v in allow):
+                    raise ValueError("each broker command needs a list of allowed subcommands")
+        return copy.deepcopy(value)
+
+    def parse(self, key, values):
+        if isinstance(self.default, dict):
+            if len(values) != 1:
+                raise ValueError(f"{key} takes one JSON object")
+            try:
+                value = json.loads(values[0])
+            except ValueError:
+                raise ValueError(f"{key} requires a valid JSON object") from None
+        elif isinstance(self.default, list):
+            value = [v.replace(str(HOME), "~", 1) if v.startswith(str(HOME)) else v for v in values]
+        else:
+            if len(values) != 1:
+                raise ValueError(f"{key} takes one value")
+            value = values[0]
+            if isinstance(self.default, bool):
+                if value.lower() not in ("true", "false", "yes", "no", "on", "off", "1", "0"):
+                    raise ValueError(f"{key} is yes or no")
+                value = value.lower() in ("true", "yes", "on", "1")
+            elif isinstance(self.default, int):
+                try:
+                    value = int(value)
+                except ValueError:
+                    raise ValueError(f"{key} must be a number") from None
+        return self.validate(key, value)
+
+
+_descriptions = {
+    "ssh_keys": "SSH key names supplied by you; files are never inspected by this editor",
+    "ssh_config": "Let the SSH broker use your host aliases and connection settings",
+    "ssh_hosts": "Allowed SSH destinations (globs accepted; empty allows any host)",
+    "writable": "Additional paths the agent may change",
+    "readable": "Additional paths the agent may read",
+    "hidden": "Paths to hide even when their parent is exposed",
+    "path_dirs": "Expose installed tools from PATH as read-only",
+    "git_config": "Expose your Git identity and configuration as read-only",
+    "gpg": "Enable signing and decryption through the host GPG agent",
+    "check_updates": "ask: show an update hint; always: install; never: stay offline",
+    "nice": "CPU priority: 0 is normal, 19 is lowest",
+    "ionice": "Disk I/O priority",
+    "memory_max": "Memory limit: for example 4G or 50%; blank leaves it unlimited",
+    "swap_max": "Swap limit: for example 1G or 0; blank leaves it unlimited",
+    "onboarding_complete": "First-run setup has been completed",
+    "profile_settings": "Sandbox and resource settings saved independently for each history profile",
+    "default_tool": "Agent of the saved default account",
+    "default_profiles": "Default history for each tool (tool: profile; otherwise main)",
+    "default_logins": "Default account for each tool (tool: login; otherwise main)",
+    "logins": "Legacy profile-specific account overrides, keyed by tool/profile",
+    "brokered": "Host commands and their allowed subcommands",
+}
+SETTINGS = {key: Setting(value, _descriptions[key],
+            {"ionice": ("idle", "low", "normal"), "check_updates": ("ask", "always", "never"), "default_tool": ("claude", "codex")}.get(key, ()),
+            "global" if key in ("check_updates", "onboarding_complete", "profile_settings", "default_tool", "default_profiles", "default_logins", "logins") else "profile")
+            for key, value in _defaults.items()}
+DEFAULTS = {key: copy.deepcopy(setting.default) for key, setting in SETTINGS.items()}
+del _defaults, _descriptions
+
+
+def validate_name(name):
+    if (not isinstance(name, str) or not name.strip() or name in (".", "..")
+            or "/" in name or "\\" in name or any(ord(c) < 32 for c in name)):
+        raise ValueError("Use a non-empty name without slashes or control characters")
+    return name
+
+
+class Configuration:
+    """One schema for file loading, CLI edits, onboarding and the TUI."""
+    @staticmethod
+    def validate(raw):
+        if not isinstance(raw, dict):
+            raise ValueError("configuration must be a JSON object")
+        for key, setting in SETTINGS.items():
+            if key in raw:
+                setting.validate(key, raw[key])
+        return raw
+
+    @staticmethod
+    def parse(key, values):
+        if key not in SETTINGS:
+            raise ValueError(f"unknown setting: {key}")
+        return SETTINGS[key].parse(key, values)
+
+    @staticmethod
+    def effective(raw, tool=None, name=None):
+        cfg = {key: copy.deepcopy(raw.get(key, setting.default)) for key, setting in SETTINGS.items()}
+        if tool is not None and name is not None:
+            cfg.update(copy.deepcopy(raw.get("profile_settings", {}).get(f"{tool.bin}/{name}", {})))
+        return cfg
+
+    @staticmethod
+    def validate_profile(overrides):
+        if not isinstance(overrides, dict):
+            raise ValueError("profile settings must be an object")
+        for key, value in overrides.items():
+            if key not in SETTINGS or SETTINGS[key].scope != "profile":
+                raise ValueError(f"{key} is not a per-profile setting")
+            SETTINGS[key].validate(key, value)
+
+    @staticmethod
+    def commit_profile(tool, name, base, draft):
+        profile(tool, name)
+        Configuration.validate_profile(draft)
+        raw = read_cfg()
+        profiles = copy.deepcopy(raw.get("profile_settings", {}))
+        key = f"{tool.bin}/{name}"
+        current = profiles.get(key, {})
+        for field in (k for k in SETTINGS if SETTINGS[k].scope == "profile"):
+            if base.get(field) != draft.get(field) or (field in base) != (field in draft):
+                if current.get(field) != base.get(field) or (field in current) != (field in base):
+                    raise ValueError(f"{field} changed elsewhere; reopen this profile's settings")
+                if field in draft:
+                    current[field] = draft[field]
+                else:
+                    current.pop(field, None)
+        if current:
+            profiles[key] = current
+        else:
+            profiles.pop(key, None)
+        raw["profile_settings"] = profiles
+        Configuration.save(raw)
+
+    @staticmethod
+    def save(raw):
+        Configuration.validate(raw)
+        # Preserve forward-compatible fields and never persist environment overrides.
+        body = {**raw,
+                "config_version": max((CONFIG_VERSION, raw.get("config_version", "0")), key=_vtuple),
+                "silo_min_version": max((CONFIG_MIN_SILO, raw.get("silo_min_version", "0")), key=_vtuple)}
+        ROOT.mkdir(parents=True, exist_ok=True)
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=ROOT, prefix=".config-", delete=False) as f:
+                tmp = Path(f.name)
+                json.dump(body, f, indent=2)
+                f.write("\n")
+            tmp.replace(CONFIG)
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def selections(tool):
+        cfg = Configuration.effective(read_cfg())
+        return cfg["default_profiles"].get(tool.bin, "main"), cfg["default_logins"].get(tool.bin, "main")
+
+    @staticmethod
+    def launch(tool, profile_name=None, login=None):
+        default_profile, default_login = Configuration.selections(tool)
+        return validate_name(profile_name or default_profile), validate_name(login or default_login)
+
+    @staticmethod
+    def set_defaults(tool, profile_name, login):
+        validate_name(profile_name)
+        validate_name(login)
+        raw = read_cfg()
+        raw["default_tool"] = tool.bin
+        raw["default_profiles"] = {**raw.get("default_profiles", {}), tool.bin: profile_name}
+        raw["default_logins"] = {**raw.get("default_logins", {}), tool.bin: login}
+        Configuration.save(raw)
+
+    @staticmethod
+    def commit(base, draft):
+        current = read_cfg()
+        changed = [key for key in SETTINGS if base.get(key) != draft.get(key) or (key in base) != (key in draft)]
+        for key in changed:
+            if current.get(key) != base.get(key) or (key in current) != (key in base):
+                raise ValueError(f"{key} changed elsewhere; cancel and reopen Settings")
+            if key in draft:
+                current[key] = draft[key]
+            else:
+                current.pop(key, None)
+        Configuration.save(current)
+
 STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "silo"
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/cc-socks-{os.getuid()}"))
 
@@ -49,8 +275,8 @@ die = lambda m: (err.print(f"[red]✗[/] {m}"), sys.exit(1))
 # Bump CONFIG_VERSION minor for added keys (older silo warns, keeps going), major for
 # incompatible changes (older silo refuses); CONFIG_MIN_SILO is the silo release that
 # introduced the current schema.
-CONFIG_VERSION = "1.2"
-CONFIG_MIN_SILO = "0.6.0"
+CONFIG_VERSION = "1.4"
+CONFIG_MIN_SILO = "0.8.0"
 META = ("config_version", "silo_min_version")
 
 
@@ -58,10 +284,14 @@ def read_cfg():
     """the file as written (no defaults, no env), after version checks."""
     try:
         raw = json.loads(CONFIG.read_text())
-    except OSError:
+    except FileNotFoundError:
         return {}
+    except OSError as e:
+        raise click.ClickException(f"Cannot read {CONFIG}: {e}") from e
     except ValueError as e:
         die(f"{CONFIG} is not valid JSON: {e}")
+    if not isinstance(raw, dict):
+        die(f"{CONFIG} must contain a JSON object")
     need = raw.get("silo_min_version", "0")
     if _vtuple(need) > _vtuple(VERSION):
         die(f"{CONFIG} needs silo >= {need} (you have {VERSION}); run [cyan]silo update[/]")
@@ -73,20 +303,22 @@ def read_cfg():
     if "ssh_key" in raw:                                   # config 1.0: a single key
         old = raw.pop("ssh_key")
         raw.setdefault("ssh_keys", [old] if old else [])
-    return raw
+    try:
+        return Configuration.validate(raw)
+    except ValueError as e:
+        die(str(e))
 
 
 def save_cfg(raw):
-    """write only user settings + version stamps (never env overrides or defaults filled in)."""
-    body = {k: raw[k] for k in DEFAULTS if k in raw}
-    ROOT.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps({"config_version": CONFIG_VERSION, "silo_min_version": CONFIG_MIN_SILO,
-                                  **body}, indent=2) + "\n")
+    """Validate and atomically save user settings, preserving unknown fields."""
+    try:
+        Configuration.save(raw)
+    except (ValueError, OSError) as e:
+        raise click.ClickException(str(e)) from e
 
 
-def load_cfg():
-    cfg = dict(DEFAULTS)
-    cfg.update({k: v for k, v in read_cfg().items() if k in DEFAULTS})
+def load_cfg(tool=None, name=None):
+    cfg = Configuration.effective(read_cfg(), tool, name)
     if env := os.environ.get("SILO_SSH_KEYS") or os.environ.get("SILO_SSH_KEY"):
         cfg["ssh_keys"] = env.replace(",", " ").split()
     return cfg
@@ -158,13 +390,19 @@ TOOLS = {
 }
 ALIASES = {"silo": "claude", "silo-codex": "codex"}  # argv[0] -> default tool
 
+def default_tool():
+    if Path(sys.argv[0]).name == "silo-codex":
+        return "codex"
+    return Configuration.effective(read_cfg())["default_tool"]
+
+
 ABOUT = """\
 Profiles (histories) live in [cyan]~/.config/silo/TOOL/NAME[/], each its own config dir
 ({envs}), so any number run at once.  Logins (accounts) live apart in [cyan]~/.config/silo/logins[/];
 a profile runs with the login of its own name unless [bold]login use[/] or [bold]--login[/] picks another.  Claude profiles share the session
 registry of [cyan]~/.claude[/], so sessions (sandboxed or not, any account) can list and message each other.
 
-[bold]Tools[/]    {tools}.  Pick with [bold]-t[/], or by alias: {aliases}.
+[bold]Tools[/]    {tools}.  Run [bold]silo TOOL --profile NAME --login NAME[/]. Profile and login defaults are independent (main until you save another selection). Pick with [bold]-t[/], or by alias: {aliases}.
          Add one by appending a [bold]Tool(...)[/] entry to TOOLS in this script.
 [bold]Sandbox[/]  home is read-only, secrets hidden; writable only [cyan]$PWD[/], the profile dir, the session sockets and the
          writable paths from [cyan]init[/].  [cyan]/tmp[/] is a persistent per-profile dir, so background
@@ -173,22 +411,22 @@ registry of [cyan]~/.claude[/], so sessions (sandboxed or not, any account) can 
 [bold]Config[/]   [cyan]~/.config/silo/config.json[/] ([cyan]init[/], [cyan]config[/]); env SILO_ROOT, SILO_SSH_KEYS"""
 
 EXAMPLES = """\
-[dim]$[/] silo init                      [dim]# onboarding: import logins, pick paths and ssh key[/]
-[dim]$[/] silo config nice 5             [dim]# change one setting (silo config: show all)[/]
-[dim]$[/] silo new work && silo work auth login
-[dim]$[/] silo work                      [dim]# interactive claude session as 'work'[/]
-[dim]$[/] silo work -c                   [dim]# any claude flag passes through[/]
-[dim]$[/] silo work --login main -c      [dim]# work's history, main's account[/]
-[dim]$[/] silo work --bg 'refactor X'    [dim]# background agent, survives exit[/]
-[dim]$[/] silo work --remote-control
-[dim]$[/] silo -t codex new main --current   [dim]# codex profile  (or the silo-codex alias)[/]
-[dim]$[/] silo-codex main --full-auto
-[dim]$[/] silo work --shell              [dim]# poke around inside the sandbox[/]"""
+[dim]$[/] silo                           [dim]# profiles, logins and settings menu[/]
+[dim]$[/] silo claude
+[dim]$[/] silo codex --login=work
+[dim]$[/] silo claude --profile=research --login=work -c
+[dim]$[/] silo codex --profile=research --login=work exec 'review changes'
+[dim]$[/] silo claude login add work
+[dim]$[/] silo claude new work
+[dim]$[/] silo claude --login=work auth login
+[dim]$[/] silo claude --profile=work --shell"""
 
 
 class RichHelp:
     def format_help(self, ctx, formatter):
         out.print(f"[bold cyan]{ctx.command_path}[/] [dim]{' '.join(self.collect_usage_pieces(ctx))}[/]")
+        if isinstance(self, Cli):
+            out.print("silo [claude|codex] [--profile NAME] [--login NAME] [TOOL ARGS]...", markup=False)
         if self.help:
             out.print(f"\n{self.help}\n")
         if isinstance(self, click.Group):
@@ -196,8 +434,7 @@ class RichHelp:
             for name, cmd in self.commands.items():
                 if not cmd.hidden:
                     t.add_row(f"[bold green]{name}[/] [dim]{' '.join(cmd.collect_usage_pieces(ctx))}[/]", cmd.help or "")
-            t.add_row("[bold green]NAME[/] [dim][TOOL ARGS]...[/]", "run the tool as profile NAME (any of its flags work)")
-            t.add_row("[bold green]NAME[/] [dim]--shell[/]", "a shell inside NAME's sandbox, for debugging")
+            t.add_row("[bold green]TOOL[/] [dim][--profile NAME] [--login NAME] [TOOL ARGS]...[/]", "run an agent with the selected history and account")
             out.print(Panel(t, title="Commands", title_align="left", border_style="dim"))
             out.print(Panel(EXAMPLES, title="Examples", title_align="left", border_style="dim"))
             about = ABOUT.format(tools=", ".join(TOOLS), envs=", ".join(t.env for t in TOOLS.values()),
@@ -206,6 +443,11 @@ class RichHelp:
         opts = [p for p in self.params if isinstance(p, click.Option) and not p.hidden]
         if opts:
             t = Table(box=None, padding=(0, 2), show_header=False)
+            if isinstance(self, Cli):
+                t.add_row("[bold green](no arguments)[/]", "open the terminal menu")
+                t.add_row("[bold green]--profile NAME[/]", "history to use (independent saved default, otherwise main)")
+                t.add_row("[bold green]--login NAME[/]", "account to use (independent saved default, otherwise main)")
+                t.add_row("[bold green]-h, --help[/]", "show this help")
             for p in opts:
                 t.add_row("[bold green]" + ", ".join(p.opts) + "[/]", p.help or "")
             out.print(Panel(t, title="Options", title_align="left", border_style="dim"))
@@ -218,6 +460,48 @@ class Cmd(RichHelp, click.Command):
 class Cli(RichHelp, click.Group):
     command_class = Cmd
 
+    def parse_args(self, ctx, args):
+        args = list(args)
+        if args and args[0].split("=", 1)[0] in ("--profile", "--login"):
+            args.insert(0, default_tool())
+        if args and args[0] in TOOLS:
+            tool, rest = args[0], args[1:]
+            if rest[:1] and rest[0] in self.commands and rest[0] != "run":
+                args = ["--tool", tool, *rest]
+            elif rest[:1] and rest[0] in ("-h", "--help", "-V", "--version"):
+                args = ["--tool", tool, *rest]
+            else:
+                selectors, forwarded = {}, []
+                while rest:
+                    arg = rest.pop(0)
+                    if arg == "--":
+                        forwarded.extend([arg, *rest])
+                        break
+                    key = arg.split("=", 1)[0]
+                    if key in ("--profile", "--login"):
+                        if "=" in arg:
+                            value = arg.split("=", 1)[1]
+                        elif rest and not rest[0].startswith("-"):
+                            value = rest.pop(0)
+                        else:
+                            raise click.UsageError(f"{key} requires a name", ctx)
+                        if not value:
+                            raise click.UsageError(f"{key} requires a non-empty name", ctx)
+                        selectors[key] = value
+                    else:
+                        forwarded.append(arg)
+                rest = forwarded
+                names = []
+                while not selectors and rest and not rest[0].startswith("-") and len(names) < 2:
+                    names.append(rest.pop(0))
+                login = selectors.get("--login", names[0] if names else None)
+                history = selectors.get("--profile", names[1] if len(names) > 1 else None)
+                if rest[:1] == ["--"]:
+                    rest = rest[1:]
+                history, login = Configuration.launch(TOOLS[tool], history, login)
+                args = ["--tool", tool, "run", history, "--login", login, *rest]
+        return super().parse_args(ctx, args)
+
     def resolve_command(self, ctx, args):  # unknown subcommand == profile name
         if args and args[0] not in self.commands and not args[0].startswith("-"):
             return "run", run, args
@@ -225,9 +509,10 @@ class Cli(RichHelp, click.Group):
 
 
 def profile(tool, name):
+    validate_name(name)
     d = ROOT / tool.bin / name
     if not d.is_dir():
-        die(f"no {tool.bin} profile [bold]{name}[/]  (see [cyan]ls[/] / [cyan]new[/])")
+        raise ValueError(f"no {tool.bin} profile {name} (create it with new)")
     return d
 
 
@@ -238,14 +523,17 @@ def login_of(tool, name):
 
 
 def set_login(tool, name, login):
+    validate_name(name)
+    validate_name(login)
     raw = read_cfg()
     m = {k: v for k, v in raw.get("logins", {}).items() if k != f"{tool.bin}/{name}"}
     raw["logins"] = {**m, f"{tool.bin}/{name}": login} if login != name else m
-    save_cfg(raw)
+    Configuration.save(raw)
 
 
 def login_users(tool, login):
-    return [p.name for p in sorted((ROOT / tool.bin).glob("*/")) if login_of(tool, p.name) == login]
+    mapping = read_cfg().get("logins", {})
+    return [p.name for p in sorted((ROOT / tool.bin).glob("*/")) if mapping.get(f"{tool.bin}/{p.name}") == login]
 
 
 def json_file(path):
@@ -262,12 +550,19 @@ def write_json(path, data):
 
 
 def import_login(tool, login):
-    """copy this machine's current login into the store as LOGIN."""
+    """Copy a native account into the login store, without conversation history."""
+    validate_name(login)
+    source = native_login_home(tool)
+    if not (source / tool.cred).is_file():
+        raise ValueError(f"No {tool.bin} login found in {source}")
     ld = LOGINS / tool.bin / login
     ld.mkdir(parents=True, exist_ok=True, mode=0o700)
-    shutil.copy2(tool.home / tool.cred, ld)
-    if tool.acct and (a := json_file(tool.acct[2]).get(tool.acct[0])):
-        write_json(ld / tool.acct[1], {tool.acct[0]: a})
+    shutil.copy2(source / tool.cred, ld)
+    (ld / tool.cred).chmod(0o600)
+    if tool.acct:
+        account_source = tool.acct[2] if native_home(tool) == tool.home else native_home(tool) / tool.acct[1]
+        if account := json_file(account_source).get(tool.acct[0]):
+            write_json(ld / tool.acct[1], {tool.acct[0]: account})
 
 
 def attach(tool, name, d, login):
@@ -404,7 +699,8 @@ def rtdir(tool, name):  # host-only state; $XDG_RUNTIME_DIR is hidden from the s
 
 def ensure_broker(tool, name, cfg):
     """start the profile's ssh-agent (if a key is set) + broker if needed; return the broker socket."""
-    rt, d = rtdir(tool, name), profile(tool, name)
+    rt = rtdir(tool, name)
+    d = runtime_dir_from_key(tool, name) if "@" in name else profile(tool, name)
     agent = rt / "agent.sock"
     keys, state = cfg["ssh_keys"], rt / "agent.keys"
     try:
@@ -448,7 +744,8 @@ def ensure_broker(tool, name, cfg):
 
 
 def broker_serve(tool, name):
-    rt, d = rtdir(tool, name), profile(tool, name)
+    rt = rtdir(tool, name)
+    d = runtime_dir_from_key(tool, name) if "@" in name else profile(tool, name)
     sock = d / "ssh.sock"
     sock.unlink(missing_ok=True)
     srv = socket.socket(socket.AF_UNIX)
@@ -462,7 +759,8 @@ def broker_serve(tool, name):
         try:
             msg, fds, _, _ = socket.recv_fds(conn, 1 << 20, 3)
             req = json.loads(msg)
-            cfg = load_cfg()
+            from urllib.parse import unquote
+            cfg = load_cfg(tool, unquote(name.split("@", 1)[0]))
             cmd = req.get("cmd", "ssh")
             if cmd != "ssh":
                 why = cmd_vet(cmd, req["argv"], req.get("cwd", ""), cfg, rt)
@@ -583,13 +881,16 @@ def under(path, roots):
 def sandbox(tool, name, login=None):
     """bwrap argv (without the command) for profile NAME of TOOL, logged in as LOGIN.  Home is an empty
     tmpfs: only the cwd, the profile, its login, `writable` (rw) and `readable`, PATH dirs, git config (ro) exist."""
-    cfg = load_cfg()
-    d = profile(tool, name)
+    cfg = load_cfg(tool, name)
+    history = profile(tool, name)
+    login = login or Configuration.launch(tool, name)[1]
+    d = runtime_profile(tool, name, login)
+    runtime_name = runtime_key(name, login)
     wd = Path.cwd().resolve()
     if wd == HOME or wd in HOME.parents:                  # home itself, /home, /
         die(f"run silo from a project directory: the working directory ({wd}) is mounted read-write")
     (d / "tmp").mkdir(exist_ok=True)
-    rw = [wd, d, *(Path(p).expanduser().resolve() for p in cfg["writable"])]
+    rw = [wd, d, history, *(Path(p).expanduser().resolve() for p in cfg["writable"])]
     ro = [Path(p).expanduser() for p in cfg["readable"]]
     if cfg["path_dirs"]:
         ro += [Path(p) for p in os.environ.get("PATH", "").split(":")
@@ -625,9 +926,9 @@ def sandbox(tool, name, login=None):
         f = Path(f)
         if under(f, seen) and f.exists() and not under(d, [f]):
             b += ["--tmpfs", f] if f.is_dir() else ["--ro-bind", "/dev/null", f]
-    b += attach(tool, name, d, login or login_of(tool, name))   # after the masks: only this login is visible
+    b += attach(tool, runtime_name, d, login)   # after the masks: only this login is visible
 
-    rt = rtdir(tool, name)                                 # roots the broker accepts as cwd
+    rt = rtdir(tool, runtime_name)                                 # roots the broker accepts as cwd
     try:
         roots = set(json.loads((rt / "roots.json").read_text()))
     except (OSError, ValueError):
@@ -638,13 +939,15 @@ def sandbox(tool, name, login=None):
     if cfg["ssh_keys"] and Path("/usr/bin/ssh").exists():
         shims["ssh"] = "/usr/bin/ssh"
     if shims:
-        sock = str(ensure_broker(tool, name, cfg))
+        sock = str(ensure_broker(tool, runtime_name, cfg))
         for c, x in shims.items():
             ro_data(b, SHIM.format(sock=sock, cmd=c).encode(), Path(x), "0755")
     if cfg["gpg"] and shutil.which("gpgconf"):
         b += gpg_binds(d)
 
     b += ["--setenv", tool.env, d]
+    if tool.bin == "codex":
+        b += ["--setenv", "CODEX_SQLITE_HOME", history]
     for k, v in tool.setenv.items():
         b += ["--setenv", k, v]
     # keep pid + net namespaces: claude sessions check pid-namespace identity for peers
@@ -653,11 +956,132 @@ def sandbox(tool, name, login=None):
     return [str(x) for x in b]
 
 
+HISTORY_DIRS = {"claude": ("projects", "file-history", "todos", "plans"), "codex": ("sessions", "archived_sessions")}
+HISTORY_FILES = {"claude": ("history.jsonl",), "codex": ("history.jsonl", "session_index.jsonl")}
+
+
+def native_home(tool):
+    return Path(os.environ.get(tool.env, str(tool.home))).expanduser()
+
+
+def native_login_home(tool):
+    return Path(os.environ.get(tool.cred_env, str(native_home(tool)))).expanduser() if tool.cred_env else native_home(tool)
+
+
+def history_sources(tool, source=None):
+    source = Path(source) if source else native_home(tool)
+    paths = [source / name for name in (*HISTORY_DIRS[tool.bin], *HISTORY_FILES[tool.bin])]
+    if tool.bin == "codex":
+        database_home = Path(os.environ.get("CODEX_SQLITE_HOME", str(source))).expanduser()
+        paths.extend(sorted(database_home.glob("state_*.sqlite")))
+    return [p for p in paths if p.exists() and not p.is_symlink()]
+
+
+def import_history(tool, name, source=None):
+    """Copy history only; leave the source intact, and back up SQLite consistently."""
+    destination = profile(tool, name)
+    source = Path(source).expanduser() if source else native_home(tool)
+    entries = history_sources(tool, source)
+    if not entries:
+        raise ValueError(f"No {tool.bin} history found in {source}")
+    if source.resolve() == destination.resolve() or destination.resolve() in source.resolve().parents:
+        raise ValueError("History source overlaps this profile")
+    conflicts = [p.name for p in entries if (destination / p.name).exists()]
+    if conflicts:
+        raise ValueError("History already exists: " + ", ".join(conflicts) + "; import into a fresh profile")
+    staging = ROOT / ".staging"
+    staging.mkdir(parents=True, exist_ok=True, mode=0o700)
+    published = []
+    with tempfile.TemporaryDirectory(prefix="history-", dir=staging) as temporary:
+        stage = Path(temporary)
+        try:
+            for entry in entries:
+                target = stage / entry.name
+                if entry.is_dir():
+                    shutil.copytree(entry, target, ignore=lambda directory, names:
+                                    [n for n in names if (Path(directory) / n).is_symlink()])
+                elif entry.suffix == ".sqlite":
+                    with contextlib.closing(sqlite3.connect(entry.resolve().as_uri() + "?mode=ro", uri=True)) as original:
+                        with contextlib.closing(sqlite3.connect(target)) as copied:
+                            original.backup(copied)
+                            columns = [r[1] for r in copied.execute("PRAGMA table_info(threads)")]
+                            if "rollout_path" in columns:
+                                for row_id, rollout in copied.execute("SELECT rowid, rollout_path FROM threads").fetchall():
+                                    try:
+                                        relative = Path(rollout).relative_to(source)
+                                    except (ValueError, TypeError):
+                                        continue
+                                    copied.execute("UPDATE threads SET rollout_path=? WHERE rowid=?", (str(destination / relative), row_id))
+                            copied.commit()
+                    target.chmod(0o600)
+                else:
+                    shutil.copy2(entry, target)
+            for entry in entries:
+                (stage / entry.name).rename(destination / entry.name)
+                published.append(destination / entry.name)
+        except BaseException:
+            for path in published:
+                shutil.rmtree(path) if path.is_dir() else path.unlink(missing_ok=True)
+            raise
+    return [p.name for p in entries]
+
+
+def runtime_key(name, login):
+    from urllib.parse import quote
+    return quote(name, safe="") + "@" + quote(login, safe="")
+
+
+def runtime_dir_from_key(tool, key):
+    from urllib.parse import unquote
+    name, login = (unquote(part) for part in key.split("@", 1))
+    validate_name(name)
+    validate_name(login)
+    return ROOT / ".runs" / tool.bin / name / login
+
+
+def runtime_profile(tool, name, login):
+    """Private runtime/auth state per pair; shared history stays in the profile."""
+    base = profile(tool, name)
+    validate_name(login)
+    d = runtime_dir_from_key(tool, runtime_key(name, login))
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    credential = base / tool.cred
+    if credential.exists() and not credential.is_symlink():
+        old = LOGINS / tool.bin / login_of(tool, name)
+        old.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.move(credential, old / tool.cred)
+    if credential.is_symlink():
+        credential.unlink()
+    for entry in base.iterdir():
+        if entry.name in (tool.cred, "tmp", "ssh.sock", "daemon", "jobs") or (tool.acct and entry.name == tool.acct[1]):
+            continue
+        if entry.suffix == ".sqlite" or entry.name.endswith((".sqlite-wal", ".sqlite-shm")):
+            continue
+        target = d / entry.name
+        if not target.exists() and not target.is_symlink():
+            target.symlink_to(entry)
+    for folder in HISTORY_DIRS[tool.bin]:
+        (base / folder).mkdir(exist_ok=True)
+        if not (d / folder).exists() and not (d / folder).is_symlink():
+            (d / folder).symlink_to(base / folder)
+    for filename in HISTORY_FILES[tool.bin]:
+        (base / filename).touch(exist_ok=True)
+        if not (d / filename).exists() and not (d / filename).is_symlink():
+            (d / filename).symlink_to(base / filename)
+    (d / "tmp").mkdir(exist_ok=True, mode=0o700)
+    return d
+
+
 def create(tool, name, current, login=None):
+    validate_name(name)
+    validate_name(login or Configuration.selections(tool)[1])
+    if current and not (tool.home / tool.cred).is_file():
+        raise ValueError(f"{tool.bin} is not logged in on this machine")
     d = ROOT / tool.bin / name
-    login = login or name
+    assigned_login = login is not None
+    login = login or Configuration.selections(tool)[1]
     if d.exists():
-        die(f"{tool.bin} profile [bold]{name}[/] already exists")
+        raise ValueError(f"{tool.bin} profile {name} already exists")
     d.mkdir(parents=True, mode=0o700)
     for f in tool.copy:   # per-profile copies: the tool edits them
         if (tool.home / f).exists():
@@ -665,18 +1089,147 @@ def create(tool, name, current, login=None):
     for f in tool.link:   # shared with the tool's main config
         if (tool.home / f).exists():
             (d / f).symlink_to(tool.home / f)
-    if login != name:
+    if assigned_login and login != name:
         set_login(tool, name, login)
     if current:
         for f in tool.login:   # the tool's state (project trust etc.) seeds the profile; credentials go to the login
             if f.name != tool.cred:
                 shutil.copy2(f, d)
         import_login(tool, login)
-        ok(f"created {tool.bin} profile [bold]{name}[/] with the current login as login [bold]{login}[/]")
-    elif (LOGINS / tool.bin / login / tool.cred).exists():
-        ok(f"created {tool.bin} profile [bold]{name}[/] using login [bold]{login}[/]")
+        return f"created {tool.bin} profile [bold]{name}[/] with the current login as login [bold]{login}[/]"
     else:
-        ok(f"created {tool.bin} profile [bold]{name}[/]  -  now run:  [cyan]{Path(sys.argv[0]).name} {name} {tool.login_cmd}[/]")
+        return f"created {tool.bin} profile [bold]{name}[/]"
+
+
+def call_operation(fn, *args, **kwargs):
+    """CLI error formatting around the operations also used by the TUI."""
+    try:
+        return fn(*args, **kwargs)
+    except (ValueError, OSError) as e:
+        raise click.ClickException(str(e)) from e
+
+
+def add_login(tool, name, current=False):
+    validate_name(name)
+    ld = LOGINS / tool.bin / name
+    if ld.exists() and not current:
+        raise ValueError(f"{tool.bin} login {name} already exists")
+    if current:
+        if not (native_login_home(tool) / tool.cred).is_file():
+            raise ValueError(f"{tool.bin} is not logged in on this machine")
+        import_login(tool, name)
+    else:
+        ld.mkdir(parents=True, mode=0o700)
+    return f"created {tool.bin} login {name}"
+
+
+def assign_login(tool, name, login):
+    profile(tool, name)
+    validate_name(login)
+    if not (LOGINS / tool.bin / login).is_dir():
+        raise ValueError(f"no {tool.bin} login {login}")
+    set_login(tool, name, login)
+
+
+def delete_login(tool, name):
+    validate_name(name)
+    ld = LOGINS / tool.bin / name
+    if not ld.is_dir():
+        raise ValueError(f"no {tool.bin} login {name}")
+    if Configuration.selections(tool)[1] == name:
+        raise ValueError("This is the default login; select another and save defaults first")
+    if users := login_users(tool, name):
+        raise ValueError(f"profiles default to this login: {', '.join(users)}; select another login first")
+    shutil.rmtree(ld)
+    return f"removed {tool.bin} login {name}"
+
+
+def launch_argv(tool, name, login=None, args=()):
+    name, login = Configuration.launch(tool, name, login)
+    profile(tool, name)
+    if not (LOGINS / tool.bin / login).is_dir():
+        raise ValueError(f"no {tool.bin} login {login}; add it first")
+    cmd = [os.environ.get("SHELL", "/bin/sh")] if list(args) == ["--shell"] else [tool.bin, *args]
+    return limits(load_cfg(tool, name)) + sandbox(tool, name, login) + cmd
+
+
+def run_authentication(tool, login):
+    """Authenticate an account without creating or using persistent conversation history."""
+    validate_name(login)
+    ld = LOGINS / tool.bin / login
+    if not ld.is_dir():
+        raise ValueError(f"no {tool.bin} login {login}; add it first")
+    parent = ROOT / tool.bin
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".auth-", dir=parent) as temporary:
+        d = Path(temporary)
+        try:
+            for f in tool.copy:
+                if (tool.home / f).is_file():
+                    shutil.copy2(tool.home / f, d / f)
+            for f in tool.link:
+                if (tool.home / f).exists():
+                    (d / f).symlink_to(tool.home / f)
+            result = subprocess.run(launch_argv(tool, d.name, login, tool.login_cmd.split())).returncode
+            # Some agents replace credential symlinks by renaming new files over them.
+            runtime = runtime_dir_from_key(tool, runtime_key(d.name, login))
+            cred = runtime / tool.cred
+            if cred.is_file() and not cred.is_symlink():
+                shutil.copy2(cred, ld / tool.cred)
+            if tool.acct:
+                key, filename, _ = tool.acct
+                if account := json_file(runtime / filename).get(key):
+                    write_json(ld / filename, {key: account})
+            return result
+        finally:
+            key = runtime_key(d.name, login)
+            stop_ssh(tool, key)
+            (STATE / "logins" / f"{tool.bin}-{key}").unlink(missing_ok=True)
+            shutil.rmtree(ROOT / ".runs" / tool.bin / d.name, ignore_errors=True)
+
+
+def delete_profile(tool, name):
+    d = profile(tool, name)
+    if tool.stop and daemon_alive(d):
+        subprocess.run(sandbox(tool, name) + [tool.bin, *tool.stop], stdin=subprocess.DEVNULL)
+    stop_ssh(tool, name)
+    shutil.rmtree(d)
+    ln = login_of(tool, name)
+    (STATE / "logins" / f"{tool.bin}-{name}").unlink(missing_ok=True)
+    if f"{tool.bin}/{name}" in read_cfg().get("logins", {}):
+        set_login(tool, name, name)
+    return f"removed {tool.bin} profile [bold]{name}[/]  (login [bold]{ln}[/] kept; see [cyan]login ls[/])"
+
+
+def rename_profile(tool, name, new_name):
+    d = profile(tool, name)
+    validate_name(new_name)
+    target = ROOT / tool.bin / new_name
+    if target.exists():
+        raise ValueError(f"profile {new_name} already exists")
+    if daemon_alive(d):
+        raise ValueError("Stop this profile's background daemon before renaming it")
+    old_login = read_cfg().get("logins", {}).get(f"{tool.bin}/{name}")
+    stop_ssh(tool, name)
+    d.rename(target)
+    try:
+        raw = read_cfg()
+        mapping = dict(raw.get("logins", {}))
+        mapping.pop(f"{tool.bin}/{name}", None)
+        if old_login is not None and old_login != new_name:
+            mapping[f"{tool.bin}/{new_name}"] = old_login
+        raw["logins"] = mapping
+        overrides = dict(raw.get("profile_settings", {}))
+        if f"{tool.bin}/{name}" in overrides:
+            overrides[f"{tool.bin}/{new_name}"] = overrides.pop(f"{tool.bin}/{name}")
+        raw["profile_settings"] = overrides
+        if raw.get("default_profiles", {}).get(tool.bin) == name:
+            raw["default_profiles"] = {**raw["default_profiles"], tool.bin: new_name}
+        Configuration.save(raw)
+    except BaseException:
+        target.rename(d)
+        raise
+    (STATE / "logins" / f"{tool.bin}-{name}").unlink(missing_ok=True)
 
 
 # ---- interactive prompts (prompt_toolkit when on a tty, plain input otherwise) ----
@@ -794,23 +1347,24 @@ def path_list(intro, current, keep_label, add_label):
 
 
 @click.group(cls=Cli, context_settings=dict(help_option_names=["-h", "--help"]), invoke_without_command=True)
-@click.option("-t", "--tool", type=click.Choice(list(TOOLS)), default=ALIASES.get(Path(sys.argv[0]).name, "claude"),
+@click.option("-t", "--tool", type=click.Choice(list(TOOLS)), default=default_tool,
               show_default=True, help="which agent CLI")
 @click.version_option(VERSION, "-V", "--version", prog_name="silo")
 @click.pass_context
 def cli(ctx, tool):
-    """Run agent CLIs under named accounts, each sandboxed with bubblewrap."""
+    """Open the terminal menu, or run an agent directly under a sandboxed account."""
     ctx.obj = TOOLS[tool]
-    if ctx.invoked_subcommand not in (None, "run", "update", "check-update", "_broker", "config"):
+    if ctx.invoked_subcommand not in (None, "run", "update", "check-update", "_broker", "config", "tui"):
         ctx.call_on_close(auto_check)
     if ctx.invoked_subcommand is None:
-        out.print(ctx.get_help())
+        open_tui(tool)
 
 
 @cli.command()
 def init():
     """Onboarding: logins, filesystem, brokered ssh/gpg/gh, limits, updates."""
-    cfg = {**DEFAULTS, **{k: v for k, v in read_cfg().items() if k in DEFAULTS}}   # file only, no env
+    raw = read_cfg()
+    cfg = {**raw, **Configuration.effective(raw)}   # file only, no env
     out.print(Panel(f"Answers are saved to [cyan]{CONFIG}[/].  Re-run any time - Enter keeps the current\n"
                     "value, Tab completes.  Change one setting later with [cyan]silo config KEY VALUE[/].",
                     title="silo init", border_style="cyan"))
@@ -829,7 +1383,7 @@ def init():
             if not name:
                 out.print("    [dim]skipped[/]")
             elif not (ROOT / tool.bin / name).is_dir():
-                create(tool, name, current=True)                  # a profile of the same name uses it
+                ok(call_operation(create, tool, name, current=True))                  # a profile of the same name uses it
             elif name not in have or click.confirm(
                     f"    replace login '{name}' ({tool.email(LOGINS / tool.bin / name) or '?'}) with this one?",
                     default=False):
@@ -850,29 +1404,12 @@ def init():
 
     out.rule("[bold]3. Brokered access[/]")
     out.print("  These run [bold]outside[/] the sandbox on the agent's behalf; keys and tokens never enter it.")
-    sshdir = HOME / ".ssh"
-    keys = sorted(f.name for f in sshdir.glob("*") if f.is_file() and f.suffix != ".pub"
-                  and f.name not in ("config", "known_hosts", "known_hosts.old", "authorized_keys", "environment"))
-    out.print("  [bold]ssh[/]: keys go into a private ssh-agent for this sandbox.  Keys found: "
-              + (", ".join(f"[bold]{k}[/]" for k in keys) if keys else "[dim]none[/]"))
-    while True:
-        chosen = ask("  keys to load, separated by spaces (Tab completes; empty = no ssh):",
-                     default=" ".join(cfg["ssh_keys"]), words=keys).split()
-        missing = [k for k in chosen if not (sshdir / k).is_file()]
-        if not missing:
-            break
-        err.print(f"    [yellow]not found in ~/.ssh: {', '.join(missing)}[/]")
+    out.print("  [bold]ssh[/]: enter the key names and host aliases you want to use.")
+    chosen = ask("  keys to load, separated by spaces (empty = no ssh):",
+                 default=" ".join(cfg["ssh_keys"])).split()
     cfg["ssh_keys"] = key = list(dict.fromkeys(chosen))
     hosts_in_cfg = []
-    if key and (sshdir / "config").exists():
-        cfg["ssh_config"] = click.confirm("  use your ~/.ssh/config for those connections (aliases, ProxyJump)?",
-                                          default=cfg["ssh_config"])
-        if cfg["ssh_config"]:
-            hosts_in_cfg = sorted({h for line in (sshdir / "config").read_text().splitlines()
-                                   if line.strip().lower().startswith("host ")
-                                   for h in line.split()[1:] if not any(c in h for c in "*?!")})
-    else:
-        cfg["ssh_config"] = False
+    cfg["ssh_config"] = click.confirm("  use your SSH config for those connections?", default=cfg["ssh_config"]) if key else False
     if key:
         out.print("  allowed destinations (Tab completes your config's hosts, globs ok; none = any host):")
         hosts = keep_list(cfg["ssh_hosts"], "keep")
@@ -896,7 +1433,7 @@ def init():
     out.rule("[bold]5. Resources[/]")
     out.print("  Applied to the sandbox and everything it starts, background agents included.")
     cfg["nice"] = number("  CPU nice, 0 (normal) to 19 (lowest):", cfg["nice"], 0, 19)
-    cfg["ionice"] = choose("  IO priority", list(IONICE), cfg["ionice"])
+    cfg["ionice"] = choose("  IO priority", CHOICES["ionice"], cfg["ionice"])
     cfg["memory_max"] = ask("  memory limit, e.g. 8G or 50% (empty = none):", default=cfg["memory_max"])
     cfg["swap_max"] = ask("  swap limit, e.g. 0 or 2G (empty = none):", default=cfg["swap_max"]) \
         if cfg["memory_max"] else ""
@@ -904,7 +1441,7 @@ def init():
     out.rule("[bold]6. Updates[/]")
     out.print("  silo can check GitHub for a new version, at most once a day, after commands like [cyan]ls[/].\n"
               "  [bold]ask[/] = print a hint   [bold]always[/] = install it   [bold]never[/] = stay offline")
-    cfg["check_updates"] = choose("  automatic update checks", ["ask", "always", "never"], cfg["check_updates"])
+    cfg["check_updates"] = choose("  automatic update checks", CHOICES["check_updates"], cfg["check_updates"])
 
     save_cfg(cfg)
     t = Table(box=None, show_header=False, padding=(0, 2))
@@ -933,10 +1470,9 @@ def run(tool, name, args):
         login, args = args[1], args[2:]
     elif args[:1] and args[0].startswith("--login="):
         login, args = args[0].split("=", 1)[1], args[1:]
-    if login and not (LOGINS / tool.bin / login).is_dir():
-        die(f"no {tool.bin} login [bold]{login}[/]  (see [cyan]login ls[/] / [cyan]login add[/])")
-    cmd = [os.environ.get("SHELL", "/bin/sh")] if args == ["--shell"] else [tool.bin, *args]
-    argv = limits(load_cfg()) + sandbox(tool, name, login) + cmd
+    if login is None:
+        login = read_cfg().get("logins", {}).get(f"{tool.bin}/{name}")
+    argv = call_operation(launch_argv, tool, name, login, args)
     os.execvp(argv[0], argv)
 
 
@@ -999,7 +1535,29 @@ def ls(tool, every):
 @click.pass_obj
 def new(tool, name, current, login):
     """Create profile NAME (a history; its login is separate)."""
-    create(tool, name, current, login)
+    ok(call_operation(create, tool, name, current, login))
+    if login is not None:
+        call_operation(assign_login, tool, name, login)
+
+
+@cli.command("import-history")
+@click.argument("name")
+@click.option("--source", type=click.Path(path_type=Path), help="source configuration directory (default: native agent home)")
+@click.pass_obj
+def import_history_cli(tool, name, source):
+    """Copy this machine's conversations into a fresh history profile."""
+    copied = call_operation(import_history, tool, name, source)
+    ok(f"imported history into {tool.bin}/{name}: {', '.join(copied)}")
+
+
+@cli.command("rename")
+@click.argument("name")
+@click.argument("new_name")
+@click.pass_obj
+def rename(tool, name, new_name):
+    """Rename a profile, keeping its history and default login."""
+    call_operation(rename_profile, tool, name, new_name)
+    ok(f"renamed {tool.bin} profile {name} to {new_name}")
 
 
 @cli.command()
@@ -1008,16 +1566,8 @@ def new(tool, name, current, login):
 @click.pass_obj
 def rm(tool, name):
     """Delete profile NAME (stops its background agents first)."""
-    d = profile(tool, name)
-    if tool.stop and daemon_alive(d):
-        subprocess.run(sandbox(tool, name) + [tool.bin, *tool.stop], stdin=subprocess.DEVNULL)
-    stop_ssh(tool, name)
-    shutil.rmtree(d)
-    ln = login_of(tool, name)
-    (STATE / "logins" / f"{tool.bin}-{name}").unlink(missing_ok=True)
-    if f"{tool.bin}/{name}" in read_cfg().get("logins", {}):
-        set_login(tool, name, name)
-    ok(f"removed {tool.bin} profile [bold]{name}[/]  (login [bold]{ln}[/] kept; see [cyan]login ls[/])")
+    ok(call_operation(delete_profile, tool, name))
+
 
 
 @cli.group(invoke_without_command=True)
@@ -1053,17 +1603,18 @@ def login_ls(tool, every=False):
 @click.pass_obj
 def login_add(tool, name, current):
     """Create login NAME (then log in through any profile with --login NAME)."""
-    ld = LOGINS / tool.bin / name
-    if ld.exists() and not current:
-        die(f"{tool.bin} login [bold]{name}[/] already exists")
-    if current:
-        if not (tool.home / tool.cred).exists():
-            die(f"{tool.bin} is not logged in on this machine")
-        import_login(tool, name)
-        return ok(f"{tool.bin} login [bold]{name}[/] = the current login ({tool.current_email() or '?'})")
-    ld.mkdir(parents=True, mode=0o700)
-    ok(f"created {tool.bin} login [bold]{name}[/]  -  now run:  "
-       f"[cyan]{Path(sys.argv[0]).name} PROFILE --login {name} {tool.login_cmd}[/]")
+    ok(call_operation(add_login, tool, name, current))
+
+
+
+@login.command("auth")
+@click.argument("name")
+@click.pass_obj
+def login_auth(tool, name):
+    """Authenticate an account in a temporary sandbox, without a history profile."""
+    code = call_operation(run_authentication, tool, name)
+    if code:
+        raise click.ClickException(f"authentication exited with status {code}")
 
 
 @login.command("use")
@@ -1072,10 +1623,7 @@ def login_add(tool, name, current):
 @click.pass_obj
 def login_use(tool, profile_name, name):
     """Make LOGIN the default login of PROFILE."""
-    profile(tool, profile_name)
-    if not (LOGINS / tool.bin / name).is_dir():
-        die(f"no {tool.bin} login [bold]{name}[/]")
-    set_login(tool, profile_name, name)
+    call_operation(assign_login, tool, profile_name, name)
     ok(f"{tool.bin} profile [bold]{profile_name}[/] now runs as login [bold]{name}[/]")
 
 
@@ -1085,17 +1633,11 @@ def login_use(tool, profile_name, name):
 @click.pass_obj
 def login_rm(tool, name):
     """Delete login NAME (refused while a profile defaults to it)."""
-    ld = LOGINS / tool.bin / name
-    if not ld.is_dir():
-        die(f"no {tool.bin} login [bold]{name}[/]")
-    if users := login_users(tool, name):
-        die(f"profiles default to it: {', '.join(users)}  (point them elsewhere with [cyan]login use[/])")
-    shutil.rmtree(ld)
-    ok(f"removed {tool.bin} login [bold]{name}[/]")
+    ok(call_operation(delete_login, tool, name))
 
 
 
-CHOICES = {"ionice": ["idle", "low", "normal"], "check_updates": ["ask", "always", "never"]}
+CHOICES = {key: list(setting.choices) for key, setting in SETTINGS.items() if setting.choices}
 
 
 def raw_cfg():
@@ -1103,29 +1645,10 @@ def raw_cfg():
 
 
 def coerce(key, values):
-    d = DEFAULTS[key]
-    if isinstance(d, dict):
-        die(f"{key} is a table; change it with [cyan]silo config --edit[/]")
-    if isinstance(d, list):
-        return [v.replace(str(HOME), "~", 1) if v.startswith(str(HOME)) else v for v in values]
-    if len(values) != 1:
-        die(f"{key} takes one value")
-    v = values[0]
-    if isinstance(d, bool):
-        if v.lower() not in ("true", "false", "yes", "no", "on", "off", "1", "0"):
-            die(f"{key} is yes or no")
-        return v.lower() in ("true", "yes", "on", "1")
-    if isinstance(d, int):
-        try:
-            v = int(v)
-        except ValueError:
-            die(f"{key} must be a number")
-        if key == "nice" and not 0 <= v <= 19:
-            die("nice must be between 0 and 19")
-        return v
-    if key in CHOICES and v not in CHOICES[key]:
-        die(f"{key} must be one of: {', '.join(CHOICES[key])}")
-    return v
+    try:
+        return Configuration.parse(key, values)
+    except ValueError as e:
+        die(str(e))
 
 
 def show(v):
@@ -1144,27 +1667,49 @@ def show(v):
 @click.option("--add", "add", multiple=True, metavar="VALUE", help="append to a list setting")
 @click.option("--drop", "drop", multiple=True, metavar="VALUE", help="take a value out of a list setting")
 @click.option("--unset", is_flag=True, help="reset KEY to its default")
+@click.option("--profile", "profile_name", metavar="NAME", help="edit sandbox settings for this profile")
+@click.pass_obj
 @click.option("-e", "--edit", is_flag=True, help="open config.json in $EDITOR")
-def config(key, values, add, drop, unset, edit):
+def config(tool, key, values, add, drop, unset, edit, profile_name):
     """Show or change settings:  config [KEY [VALUE...]]."""
-    raw = raw_cfg()
+    global_raw = raw_cfg()
+    if profile_name:
+        call_operation(profile, tool, profile_name)
+        raw = copy.deepcopy(global_raw.get("profile_settings", {}).get(f"{tool.bin}/{profile_name}", {}))
+    else:
+        raw = global_raw
+    base = copy.deepcopy(raw)
+    def persist(changed):
+        if profile_name:
+            call_operation(Configuration.commit_profile, tool, profile_name, base, changed)
+        else:
+            Configuration.commit(base, changed)
     if edit:
-        if not CONFIG.exists():
-            save_cfg(dict(DEFAULTS))
-        click.edit(filename=str(CONFIG))
-        raw_cfg()                                       # validate
+        edited = click.edit(json.dumps(raw, indent=2) + "\n", extension=".json")
+        if edited is None:
+            return
+        try:
+            changed = json.loads(edited)
+            Configuration.validate(changed)
+            persist(changed)
+        except (ValueError, OSError) as e:
+            raise click.ClickException(str(e)) from e
         return ok(f"saved {CONFIG}")
     if key is None:
         t = Table(box=None, padding=(0, 2), header_style="bold")
         for c in ("Key", "Value", ""):
             t.add_column(c)
         for k, d in DEFAULTS.items():
-            t.add_row(f"[bold green]{k}[/]", show(raw.get(k, d)), "" if k in raw else "[dim]default[/]")
+            if profile_name and SETTINGS[k].scope != "profile":
+                continue
+            t.add_row(f"[bold green]{k}[/]", show(raw.get(k, d)), SETTINGS[k].description + (" (default)" if k not in raw else ""))
         out.print(t)
         return out.print(f"[dim]{CONFIG}  (config v{raw.get('config_version', CONFIG_VERSION)})"
                          f"  -  silo config KEY VALUE  /  --add / --drop / --unset / --edit[/]")
     if key not in DEFAULTS:
         die(f"unknown setting [bold]{key}[/]; one of: {', '.join(DEFAULTS)}")
+    if profile_name and SETTINGS[key].scope != "profile":
+        raise click.ClickException(f"{key} is not a per-profile setting")
     if unset:
         raw.pop(key, None)
     elif add or drop:
@@ -1178,9 +1723,7 @@ def config(key, values, add, drop, unset, edit):
         raw[key] = coerce(key, list(values))
     else:
         return out.print(show(raw.get(key, DEFAULTS[key])))
-    if key == "ssh_keys" and (missing := [k for k in raw.get(key, []) if not (HOME / ".ssh" / k).is_file()]):
-        die(f"not found in ~/.ssh: {', '.join(missing)}")
-    save_cfg(raw)
+    persist(raw)
     ok(f"{key} = {show(raw.get(key, DEFAULTS[key]))}")
 
 
@@ -1384,6 +1927,194 @@ def _pace(p, el, reset, length):
     return tag
 
 
+@dataclass(frozen=True)
+class UsageSnapshot:
+    rows: tuple = ()
+    plan: str = ""
+    email: str = ""
+    at: float = 0
+    error: str = ""
+    loading: bool = False
+
+
+def usage_cache(tool, name):
+    """Only usage metadata is cached, never authentication material."""
+    raw = json_file(STATE / "usage" / f"{tool.bin}-{name}.json")
+    try:
+        rows = tuple((str(label), float(percent), float(reset) if reset else None,
+                      float(length) if length else None) for label, percent, reset, length in raw["rows"])
+        import math
+        if any(not math.isfinite(number) for row in rows for number in row[1:] if number is not None):
+            return UsageSnapshot()
+        at = float(raw["at"])
+        if not math.isfinite(at):
+            return UsageSnapshot()
+        return UsageSnapshot(rows, str(raw.get("plan") or ""), str(raw.get("email") or ""), at)
+    except (KeyError, TypeError, ValueError):
+        return UsageSnapshot()
+
+
+def usage_error(error):
+    """Do not display arbitrary exception text, which may contain request data."""
+    text = str(error)
+    if text == "not logged in":
+        return text
+    if "token expired" in text:
+        return "token expired; authenticate again"
+    if match := re.search(r"HTTP (\d{3})", text):
+        return "HTTP " + match[1] + (" · rate limited" if match[1] == "429" else "")
+    return "usage unavailable"
+
+
+def fetch_usage(tool, name, directory=None, force=False):
+    """The synchronous source used by status and the TUI's background workers."""
+    validate_name(name)
+    d = directory or LOGINS / tool.bin / name
+    cached = usage_cache(tool, name)
+    if not (d / tool.cred).is_file():
+        return UsageSnapshot(error="not logged in")
+    if not tool.usage:
+        return UsageSnapshot(error="usage unsupported")
+    if not force and cached.at and time.time() - cached.at < 60:
+        return cached
+    plan, email = cached.plan, cached.email
+    try:
+        rows = tuple(tuple(row) for row in tool.usage(d))
+    except Exception as error:
+        return UsageSnapshot(cached.rows, plan, email, cached.at, usage_error(error))
+    # Plan/account lookup runs in the same worker and never touches curses.
+    try:
+        plan = (tool.plan(d) if tool.plan else None) or plan
+        email = (tool.email(d) if tool.email else None) or email
+    except Exception:
+        pass
+    snapshot = UsageSnapshot(rows, plan, email, time.time())
+    parent = STATE / "usage"
+    temporary = None
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", dir=parent, prefix=".usage-", delete=False) as f:
+            temporary = Path(f.name)
+            json.dump({"at": snapshot.at, "rows": rows, "plan": plan, "email": email}, f)
+        temporary.replace(parent / f"{tool.bin}-{name}.json")
+    except OSError:
+        pass  # Cache failures must not hide successfully loaded usage.
+    finally:
+        if temporary:
+            temporary.unlink(missing_ok=True)
+    return snapshot
+
+
+class AsyncUsage:
+    """Daemon workers publish immutable snapshots; launch/exit never join them."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.snapshots, self.pending, self.requested = {}, set(), {}
+        self.closed = threading.Event()
+        self.slots = threading.Semaphore(4)
+
+    def snapshot(self, tool, name):
+        with self.lock:
+            return self.snapshots.get((tool.bin, name), UsageSnapshot(loading=True))
+
+    def request(self, tool, name, force=False):
+        key = (tool.bin, name)
+        with self.lock:
+            if self.closed.is_set() or key in self.pending:
+                return
+            if not force and key in self.requested and time.time() - self.requested[key] < 60:
+                return
+            cached = self.snapshots.get(key) or usage_cache(tool, name)
+            self.requested[key] = time.time()
+            if not (LOGINS / tool.bin / name / tool.cred).is_file():
+                self.snapshots[key] = UsageSnapshot(error="not logged in")
+                return
+            if not force and cached.at and time.time() - cached.at < 60:
+                self.snapshots[key] = cached
+                self.requested[key] = cached.at
+                return
+            self.snapshots[key] = UsageSnapshot(cached.rows, cached.plan, cached.email, cached.at, cached.error, True)
+            self.pending.add(key)
+        def worker():
+            try:
+                with self.slots:
+                    if self.closed.is_set():
+                        return
+                    result = fetch_usage(tool, name, force=force)
+                with self.lock:
+                    if not self.closed.is_set():
+                        self.snapshots[key] = result
+            except Exception:
+                with self.lock:
+                    if not self.closed.is_set():
+                        self.snapshots[key] = UsageSnapshot(cached.rows, cached.plan, cached.email, cached.at, "usage unavailable")
+            finally:
+                with self.lock:
+                    self.pending.discard(key)
+        threading.Thread(target=worker, name=f"silo-usage-{tool.bin}-{name}", daemon=True).start()
+
+    def close(self):
+        self.closed.set()
+
+
+class LauncherSelection:
+    """The selected account determines the agent; history/account selections are independent."""
+    def __init__(self, tool):
+        self.tool = TOOLS[tool]
+        self.focus = "profile"
+        self.remembered_profiles = {}
+        self.profile, self.login = Configuration.selections(self.tool)
+        self.reload()
+
+    def reload(self):
+        self.accounts = [(tool.bin, d.name) for tool in TOOLS.values()
+                         for d in sorted((LOGINS / tool.bin).glob("*/")) if d.is_dir()]
+        if (self.tool.bin, self.login) not in self.accounts:
+            preferred = (self.tool.bin, Configuration.selections(self.tool)[1])
+            chosen = preferred if preferred in self.accounts else next(iter(self.accounts), None)
+            if chosen:
+                self.select_account(*chosen)
+            else:
+                self.login = None
+        self.defaults = Configuration.selections(self.tool)
+        self.profiles = profile_names(self.tool)
+        if self.profile not in self.profiles:
+            self.profile = self.defaults[0] if self.defaults[0] in self.profiles else next(iter(self.profiles), None)
+
+    def select_account(self, tool_name, name):
+        if tool_name != self.tool.bin:
+            self.remembered_profiles[self.tool.bin] = self.profile
+            preferred = self.remembered_profiles.get(tool_name, self.profile)
+            self.tool = TOOLS[tool_name]
+            profiles = profile_names(self.tool)
+            default_profile = Configuration.selections(self.tool)[0]
+            self.profile = preferred if preferred in profiles else default_profile if default_profile in profiles else next(iter(profiles), None)
+        self.login = name
+
+    def move(self, direction):
+        if self.focus == "profile":
+            if self.profiles:
+                self.profile = self.profiles[(self.profiles.index(self.profile) + direction) % len(self.profiles)]
+        elif self.accounts:
+            index = self.accounts.index((self.tool.bin, self.login))
+            self.select_account(*self.accounts[(index + direction) % len(self.accounts)])
+            self.reload()
+
+    def save_defaults(self):
+        if not self.profile or not self.login:
+            raise ValueError("Select an existing profile and login first")
+        profile(self.tool, self.profile)
+        if not (LOGINS / self.tool.bin / self.login).is_dir():
+            raise ValueError("Add the selected login before saving it as the default")
+        Configuration.set_defaults(self.tool, self.profile, self.login)
+        self.defaults = (self.profile, self.login)
+
+
+def profile_names(tool):
+    return sorted(d.name for d in (ROOT / tool.bin).glob("*/") if d.is_dir() and not d.name.startswith(".auth-"))
+
+
+
 @cli.command()
 @click.option("-a", "--all", "every", is_flag=True, help="all tools, not just the selected one")
 @click.pass_obj
@@ -1403,46 +2134,31 @@ def status(tool, every):
                 jobs.append((tl, d.name, d))
     if not jobs:
         return out.print("[dim]no logins yet - try[/] login add NAME --current")
-    res = [None] * len(jobs)
-
-    age = [None] * len(jobs)
-    plans = [None] * len(jobs)
-
-    def fetch(i, tl, d):   # cached a minute; when the endpoint refuses (e.g. 429), the last answer
-        f = STATE / "usage" / f"{tl.bin}-{jobs[i][1]}.json"
-        cache = json_file(f)
-        if cache and time.time() - cache["at"] < 60:
-            res[i] = [tuple(x) for x in cache["rows"]]
-            plans[i] = cache.get("plan")
-            return
-        if tl.plan:
-            try:
-                plans[i] = tl.plan(d)
-            except RuntimeError:
-                plans[i] = cache.get("plan")
-        try:
-            res[i] = tl.usage(d)
-            f.parent.mkdir(parents=True, exist_ok=True)
-            write_json(f, {"at": time.time(), "rows": res[i], "plan": plans[i]})
-        except RuntimeError as e:
-            res[i] = [tuple(x) for x in cache["rows"]] if cache and "HTTP" in str(e) else str(e)
-            age[i] = cache and time.time() - cache["at"]
-    th = [threading.Thread(target=fetch, args=(i, j[0], j[2])) for i, j in enumerate(jobs)]
+    snapshots = [None] * len(jobs)
+    def fetch(i, tl, name, directory):
+        snapshots[i] = fetch_usage(tl, name, directory)
+    threads = [threading.Thread(target=fetch, args=(i, *job)) for i, job in enumerate(jobs)]
     with out.status("asking for usage ..."):
-        for t in th:
-            t.start()
-        for t in th:
-            t.join()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
     # one heading per login, then a short row per window: fits narrow terminals (the bar shrinks)
     w = max(5, min(20, out.width - 54))
-    for (tl, name, d), r, a, pl in zip(jobs, res, age, plans):
-        email = (tl.email and tl.email(d)) or ""
-        stale = f"  [yellow](from {_until(time.time() + a)} ago)[/]" if a and isinstance(r, list) else ""
-        out.print(f"[bold]{name}[/] [dim]{tl.bin}  {email}[/]{stale}", overflow="ellipsis", no_wrap=True)
+    for (tl, name, d), snapshot in zip(jobs, snapshots):
+        if snapshot is None:
+            snapshot = UsageSnapshot(error="usage unavailable")
+        r, pl = snapshot.rows, snapshot.plan
+        age = time.time() - snapshot.at if snapshot.at else 0
+        stale = f"  [yellow](from {_until(time.time() + age)} ago)[/]" if snapshot.at and age >= 60 else ""
+        out.print(f"[bold]{name}[/] [dim]{tl.bin}  {snapshot.email}[/]{stale}", overflow="ellipsis", no_wrap=True)
         if pl:
             out.print(f"  [cyan]{pl}[/]", overflow="ellipsis", no_wrap=True)
-        if isinstance(r, str) or not r:
-            out.print(f"  [yellow]{r or 'no limits reported'}[/]")
+        if snapshot.error:
+            out.print(f"  [yellow]{snapshot.error}[/]")
+        if not r:
+            if not snapshot.error:
+                out.print("  [yellow]no limits reported[/]")
             continue
         t = Table(box=None, padding=(0, 1), show_header=False, pad_edge=False)
         t.add_column(no_wrap=True)
@@ -1475,4 +2191,653 @@ def update():
     install_update(text, remote)
 
 
-cli()
+
+# ---- terminal UI: standard library only; all mutations use the shared operations ----
+class TerminalUI:
+    def __init__(self, screen, tool):
+        self.screen, self.tool = screen, TOOLS[tool]
+        self.message = ""
+        self.bar_colors = {}
+
+    def put(self, row, text, attr=0):
+        height, width = self.screen.getmaxyx()
+        if 0 <= row < height - 1 and width > 3:
+            try:
+                self.screen.addnstr(row, 2, str(text).replace("\n", " "), width - 4, attr)
+            except curses.error:
+                pass
+
+    def menu(self, title, items, detail="", actions=None, initial=0):
+        actions = actions or {}
+        selected = min(initial, max(0, len(items) - 1))
+        while True:
+            self.screen.erase()
+            height, width = self.screen.getmaxyx()
+            self.put(0, "silo  /  " + title, curses.A_BOLD)
+            self.put(2, detail)
+            visible = max(1, height - 9)
+            start = max(0, min(selected - visible + 1, max(0, len(items) - visible)))
+            if not items:
+                self.put(4, "Nothing here yet. Press n to create one.", curses.A_DIM)
+            for row, index in enumerate(range(start, min(start + visible, len(items))), 4):
+                self.put(row, ("> " if index == selected else "  ") + items[index],
+                         curses.A_REVERSE if index == selected else 0)
+            self.put(height - 4, self.message, curses.A_BOLD)
+            self.put(height - 3, "↑/↓ select · Enter open · Esc back")
+            self.put(height - 2, " · ".join(f"{key} {label}" for key, label in actions.items()))
+            self.screen.refresh()
+            key = self.screen.get_wch()
+            if key in ("\x1b", "\x03"):
+                return None
+            if isinstance(key, str) and key in actions:
+                self.message = ""
+                return key
+            if key in (curses.KEY_DOWN, "j") and items:
+                selected = (selected + 1) % len(items)
+            elif key in (curses.KEY_UP, "k") and items:
+                selected = (selected - 1) % len(items)
+            elif key == curses.KEY_NPAGE and items:
+                selected = min(len(items) - 1, selected + visible)
+            elif key == curses.KEY_PPAGE and items:
+                selected = max(0, selected - visible)
+            elif key in ("\n", "\r", curses.KEY_ENTER) and items:
+                self.message = ""
+                return selected
+
+    def prompt(self, title, value="", detail=""):
+        """A small editable field; Esc cancels without changing the value."""
+        text, cursor = str(value), len(str(value))
+        try:
+            curses.curs_set(1)
+            while True:
+                self.screen.erase()
+                height, width = self.screen.getmaxyx()
+                self.put(0, title, curses.A_BOLD)
+                self.put(2, detail)
+                span = max(1, width - 5)
+                offset = max(0, cursor - span + 1)
+                self.put(4, text[offset:offset + span], curses.A_REVERSE)
+                self.put(height - 3, "Enter accept · Esc cancel · Ctrl-U clear")
+                if height > 5 and width > 5:
+                    self.screen.move(4, min(width - 2, 2 + cursor - offset))
+                self.screen.refresh()
+                key = self.screen.get_wch()
+                if key in ("\x1b", "\x03"):
+                    return None
+                if key in ("\n", "\r", curses.KEY_ENTER):
+                    return text
+                if key in (curses.KEY_BACKSPACE, "\x7f", "\b") and cursor:
+                    text, cursor = text[:cursor - 1] + text[cursor:], cursor - 1
+                elif key == curses.KEY_DC:
+                    text = text[:cursor] + text[cursor + 1:]
+                elif key == curses.KEY_LEFT:
+                    cursor = max(0, cursor - 1)
+                elif key == curses.KEY_RIGHT:
+                    cursor = min(len(text), cursor + 1)
+                elif key in (curses.KEY_HOME, "\x01"):
+                    cursor = 0
+                elif key in (curses.KEY_END, "\x05"):
+                    cursor = len(text)
+                elif key == "\x15":
+                    text, cursor = "", 0
+                elif isinstance(key, str) and key.isprintable():
+                    text, cursor = text[:cursor] + key + text[cursor:], cursor + len(key)
+        finally:
+            curses.curs_set(0)
+
+    def confirm(self, title, detail=""):
+        return self.menu(title, ["Cancel", "Confirm"], detail) == 1
+
+    def attempt(self, fn, *args):
+        try:
+            return True, fn(*args)
+        except (ValueError, OSError, click.ClickException) as e:
+            self.message = str(e)
+            return False, None
+
+    def terminal(self, fn, *args):
+        """Hand off the terminal and return automatically when the command exits."""
+        curses.def_prog_mode()
+        curses.endwin()
+        result = None
+        self.message = ""
+        try:
+            try:
+                result = fn(*args)
+                if isinstance(result, int) and result:
+                    self.message = f"Exited with status {result}"
+            except (ValueError, OSError, click.ClickException) as e:
+                self.message = str(e)
+            except KeyboardInterrupt:
+                self.message = "Interrupted"
+            except SystemExit as e:
+                if e.code:
+                    self.message = f"Exited with status {e.code}"
+        finally:
+            curses.reset_prog_mode()
+            self.screen.clear()
+            self.screen.refresh()
+        return result
+
+    def new_login(self, tool):
+        name = self.prompt(f"{tool.bin} / New login name")
+        if name is None:
+            return None
+        success, _ = self.attempt(validate_name, name)
+        if not success:
+            return None
+        if (LOGINS / tool.bin / name).exists():
+            self.message = f"Login {name} already exists; select it to authenticate"
+            return None
+        found = (native_login_home(tool) / tool.cred).is_file()
+        choices = ["Copy this machine's existing account", "Authenticate a new account", "Create empty login"] if found else ["Authenticate a new account", "Create empty login"]
+        selected = self.menu("Create login", choices, f"Existing account found in {native_login_home(tool)}" if found else "No native account found")
+        if selected is None:
+            return None
+        importing = found and selected == 0
+        authenticating = selected == (1 if found else 0)
+        success, _ = self.attempt(add_login, tool, name, importing)
+        if not success:
+            return None
+        if authenticating:
+            self.authenticate(tool, name)
+        else:
+            self.message = f"Created login {name}"
+        return name
+
+    def authenticate(self, tool, login):
+        status = self.terminal(run_authentication, tool, login)
+        if status == 0 and (LOGINS / tool.bin / login / tool.cred).is_file():
+            self.message = "Authenticated"
+        elif not self.message:
+            self.message = "Authentication did not finish; retry from Manage"
+
+    @staticmethod
+    def run_agent(tool, name, login, args=()):
+        return subprocess.run(launch_argv(tool, name, login, args)).returncode
+
+    def new_profile(self):
+        name = self.prompt(f"{self.tool.bin} / New profile name", detail="Conversation history; accounts are selected independently")
+        if name is None:
+            return None
+        success, _ = self.attempt(create, self.tool, name, False)
+        if not success:
+            return None
+        sources = history_sources(self.tool)
+        if sources and self.confirm("Copy existing conversations into " + name + "?", f"Found in {native_home(self.tool)}. Originals are kept."):
+            self.message = "Copying conversation history…"
+            self.attempt(import_history, self.tool, name)
+        if (native_login_home(self.tool) / self.tool.cred).is_file() and self.confirm("Also copy your existing account?", "The account stays separate from this history profile"):
+            self.new_login(self.tool)
+        if self.confirm("Configure this profile's sandbox?", "Writable/read-only paths, hidden paths, SSH, GPG and resource limits"):
+            self.settings(self.tool, name)
+        self.message = f"Created profile {name}"
+        return name
+
+    def rename_selected_profile(self, tool, name):
+        new_name = self.prompt("Rename profile", name)
+        if new_name is None or new_name == name:
+            return name
+        success, _ = self.attempt(rename_profile, tool, name, new_name)
+        if success:
+            self.message = f"Renamed profile to {new_name}"
+            return new_name
+        return name
+
+    def onboarding(self):
+        """First-run import/create flow, also available from the launcher with o."""
+        tools = list(TOOLS)
+        while True:
+            descriptions = []
+            for key in tools:
+                tool = TOOLS[key]
+                found = []
+                if (native_login_home(tool) / tool.cred).is_file():
+                    found.append("account")
+                if history_sources(tool):
+                    found.append("history")
+                descriptions.append(f"{key.title()}: " + ("import " + " + ".join(found) if found else "create account + history"))
+            selected = self.menu("Welcome · bring your accounts and histories into silo", [*descriptions, "Finish setup"],
+                                 "Imports are copies. Sandbox settings are configured separately for each profile.")
+            if selected is None:
+                return
+            if selected == len(tools):
+                raw = read_cfg()
+                raw["onboarding_complete"] = True
+                Configuration.save(raw)
+                return
+            self.tool = TOOLS[tools[selected]]
+            names = sorted(d.name for d in (LOGINS / self.tool.bin).glob("*/") if d.is_dir())
+            login = self.new_login(self.tool) if not names else names[0]
+            existing = profile_names(self.tool)
+            name = self.new_profile() if not existing or self.confirm("Create another history profile?") else existing[0]
+            if name and login:
+                Configuration.set_defaults(self.tool, name, login)
+
+    def profile_menu(self, tool, name):
+        while True:
+            action = self.menu(f"{tool.bin} / Profile {name}", ["Rename profile", "Delete profile", "Back"], "Conversation history; account selection is independent")
+            if action in (None, 2):
+                return name
+            if action == 0:
+                name = self.rename_selected_profile(tool, name)
+            elif action == 1 and self.confirm(f"Delete profile {name}?", "Conversation history is deleted. Accounts are kept."):
+                self.terminal(delete_profile, tool, name)
+                if not (ROOT / tool.bin / name).exists():
+                    return None
+
+    def edit_list(self, title, value):
+        draft = list(value)
+        while True:
+            action = self.menu(title, draft, "One item per entry; paths may contain spaces", {"a": "add", "d": "delete", "s": "accept"})
+            if action is None:
+                return None
+            if action == "s":
+                return draft
+            if action == "a":
+                item = self.prompt("Add item")
+                if item:
+                    draft.append(item)
+            elif action == "d" and draft:
+                # Pick explicitly, avoiding deletion of an unseen cursor selection.
+                index = self.menu("Delete which item?", draft)
+                if index is not None:
+                    draft.pop(index)
+            elif isinstance(action, int):
+                item = self.prompt("Edit item", draft[action])
+                if item is not None:
+                    draft[action] = item
+
+    def edit_table(self, key, value):
+        draft = copy.deepcopy(value)
+        while True:
+            keys = sorted(draft)
+            action = self.menu(key, [f"{name}: {self.display(draft[name])}" for name in keys], SETTINGS[key].description,
+                               {"a": "add", "d": "delete", "s": "accept"})
+            if action is None:
+                return None
+            if action == "s":
+                return draft
+            if action == "d" and keys:
+                index = self.menu("Delete which entry?", keys)
+                if index is not None:
+                    del draft[keys[index]]
+                continue
+            if action == "a":
+                name = self.prompt("New entry", detail="tool/profile" if key == "logins" else "Tool name: claude or codex" if key.startswith("default_") else "Command name, for example gh")
+                if not name:
+                    continue
+                if name in draft:
+                    self.message = "That entry already exists; select it to edit"
+                    continue
+                old = [] if key == "brokered" else ""
+            elif isinstance(action, int):
+                name, old = keys[action], draft[keys[action]]
+            else:
+                continue
+            new = self.edit_list(name, old) if key == "brokered" else self.prompt("Login for " + name, old)
+            if new is not None:
+                candidate = {**draft, name: new}
+                success, _ = self.attempt(SETTINGS[key].validate, key, candidate)
+                if success:
+                    draft = candidate
+
+    @staticmethod
+    def display(value):
+        if isinstance(value, bool):
+            return "yes" if value else "no"
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value) or "(none)"
+
+    def edit_setting(self, key, value):
+        setting = SETTINGS[key]
+        if isinstance(setting.default, bool) or setting.choices:
+            choices = list(setting.choices) if setting.choices else [False, True]
+            action = self.menu(key, [self.display(v) for v in choices], setting.description, initial=choices.index(value))
+            return None if action is None else choices[action]
+        if isinstance(setting.default, list):
+            new = self.edit_list(key, value)
+            return None if new is None else Configuration.parse(key, new)
+        if isinstance(setting.default, dict):
+            return self.edit_table(key, value)
+        text = self.prompt(key, value, setting.description)
+        return None if text is None else Configuration.parse(key, [text])
+
+    def settings(self, tool=None, name=None):
+        global_raw = read_cfg()
+        scoped = tool is not None and name is not None
+        base = copy.deepcopy(global_raw.get("profile_settings", {}).get(f"{tool.bin}/{name}", {})) if scoped else global_raw
+        draft = copy.deepcopy(base)
+        selected = 0
+        while True:
+            keys = [key for key in SETTINGS if SETTINGS[key].scope == "profile"] if scoped else [key for key in SETTINGS if key != "profile_settings"]
+            effective = Configuration.effective(global_raw, tool, name) if scoped else Configuration.effective(draft)
+            effective.update(draft)
+            labels = [f"{'*' if draft.get(key) != base.get(key) or (key in draft) != (key in base) else ' '} {key:16} {self.display(effective[key])}" for key in keys]
+            action = self.menu(f"{tool.bin}/{name} · Sandbox settings" if scoped else "Global defaults", labels,
+                               "* unsaved · applies only to this profile" if scoped else "* unsaved · defaults inherited by profiles",
+                               {"s": "save", "r": "reset one", "R": "reset all", **({"g": "global defaults"} if scoped else {})}, selected)
+            if action is None:
+                if draft == base or self.confirm("Discard unsaved settings?"):
+                    return
+                continue
+            if action == "s":
+                success, _ = self.attempt(Configuration.commit_profile, tool, name, base, draft) if scoped else self.attempt(Configuration.commit, base, draft)
+                if success:
+                    self.message = "Settings saved"
+                    return
+            elif action == "g" and scoped:
+                self.settings()
+                global_raw = read_cfg()
+            elif action == "r":
+                index = self.menu("Reset which setting?", keys)
+                if index is not None:
+                    draft.pop(keys[index], None)
+            elif action == "R":
+                if self.confirm("Reset all settings to defaults?", "Resets overrides for this profile. Save to apply." if scoped else "Resets global defaults. Save to apply."):
+                    for key in keys:
+                        draft.pop(key, None)
+            elif isinstance(action, int):
+                selected, key = action, keys[action]
+                success, new = self.attempt(self.edit_setting, key, effective[key])
+                if success and new is not None:
+                    draft[key] = new
+
+    def at(self, row, column, text, width, attr=0):
+        height, columns = self.screen.getmaxyx()
+        if 0 <= row < height and 0 <= column < columns and width > 0:
+            try:
+                safe = "".join(c for c in str(text) if c.isprintable())
+                self.screen.addnstr(row, column, safe, min(width, columns - column), attr)
+            except curses.error:
+                pass
+
+    @staticmethod
+    def plain(text):
+        try:
+            return Text.from_markup(text).plain
+        except Exception:
+            return str(text)
+
+    @staticmethod
+    def color(number):
+        try:
+            return curses.color_pair(number)
+        except curses.error:
+            return 0
+
+    @staticmethod
+    def quota(snapshot, seconds):
+        for _, percent, _, length in snapshot.rows:
+            if length == seconds:
+                return percent
+        return None
+
+    def draw_usage_bar(self, row, column, percent, reset, length, width):
+        used = round(max(0, min(percent, 100)) / 100 * width)
+        elapsed = _elapsed(reset, length)
+        gone = round(elapsed * width) if elapsed is not None else 0
+        severity = 3 if percent >= 90 else 2 if percent >= 70 else 1
+        for cell in range(width):
+            top, bottom = cell < used, cell < gone
+            pair = self.bar_colors.get((severity if top else 0, bottom))
+            if pair is not None:
+                glyph, attr = "▀", self.color(pair)
+            else:
+                glyph, attr = ("█" if top and bottom else "▀" if top else "▄" if bottom else "░"), 0
+            self.at(row, column + cell, glyph, 1, attr)
+
+    def draw_dashboard(self, selection, usage):
+        self.screen.erase()
+        height, width = self.screen.getmaxyx()
+        if height < 22 or width < 72:
+            self.put(0, "silo", curses.A_BOLD)
+            self.put(2, "Resize the terminal to at least 72 columns × 22 rows")
+            self.put(height - 3, "q Quit · Esc Back")
+            self.screen.refresh()
+            return False
+        accent = self.color(1)
+        dim = curses.A_DIM
+        self.at(0, 0, "╭─ silo " + "─" * (width - 9) + "╮", width, accent)
+        for y in range(1, height - 1):
+            self.at(y, 0, "│", 1, accent)
+            self.at(y, width - 1, "│", 1, accent)
+        self.at(height - 1, 0, "╰" + "─" * (width - 2) + "╯", width, accent)
+        self.put(2, "Choose a history and account · Tab switches columns", dim)
+        left, profile_width = 3, max(22, (width - 8) // 3)
+        right = left + profile_width + 3
+        login_width = width - right - 3
+        self.at(4, left, "PROFILE · " + selection.tool.bin.title(), profile_width,
+                curses.A_BOLD | (accent if selection.focus == "profile" else dim))
+        self.at(4, right, "LOGIN · account", login_width - 14,
+                curses.A_BOLD | (accent if selection.focus == "login" else dim))
+        self.at(4, right + login_width - 13, "5h", 5, dim)
+        self.at(4, right + login_width - 6, "Weekly", 6, dim)
+        self.at(5, left, "─" * profile_width, profile_width, dim)
+        self.at(5, right, "─" * login_width, login_width, dim)
+        visible = height - 18
+        if not selection.profiles:
+            self.at(6, left, "No profiles yet", profile_width, dim)
+            self.at(7, left, "n Create profile", profile_width, accent)
+        else:
+            index = selection.profiles.index(selection.profile)
+            start = max(0, index - visible + 1)
+            for row, name in enumerate(selection.profiles[start:start + visible], 6):
+                tag = " · default" if name == selection.defaults[0] else ""
+                available = max(1, profile_width - 2 - len(tag))
+                label = name if len(name) <= available else name[:max(1, available - 1)] + "…"
+                self.at(row, left, ("› " if name == selection.profile else "  ") + label + tag, profile_width,
+                        curses.A_BOLD | accent if name == selection.profile else 0)
+        account_rows = []
+        for tool in TOOLS.values():
+            account_rows.append((tool.bin, None))
+            members = [account for account in selection.accounts if account[0] == tool.bin]
+            account_rows.extend(members or [(tool.bin, "")])
+        current = (selection.tool.bin, selection.login)
+        index = account_rows.index(current) if current in account_rows else 0
+        start = max(0, index - visible + 1)
+        if start and account_rows[start][1] is not None:
+            start = max(0, index - visible + 2)
+            shown = [(account_rows[start][0], None), *account_rows[start:start + visible - 1]]
+        else:
+            shown = account_rows[start:start + visible]
+        for row, (tool_name, name) in enumerate(shown, 6):
+            if name is None:
+                self.at(row, right, tool_name.upper(), login_width, curses.A_BOLD | dim)
+                continue
+            if not name:
+                self.at(row, right, "  No accounts · a to add", login_width, dim)
+                continue
+            chosen = (tool_name, name) == current
+            tag = " · default" if name == Configuration.selections(TOOLS[tool_name])[1] else ""
+            name_width = login_width - 15
+            available = max(1, name_width - len(tag))
+            label = name if len(name) <= available else name[:max(1, available - 1)] + "…"
+            self.at(row, right, ("› " if chosen else "  ") + label + tag, name_width + 2,
+                    curses.A_BOLD | accent if chosen else 0)
+            snapshot = usage.snapshot(TOOLS[tool_name], name)
+            if not snapshot.rows:
+                self.at(row, right + login_width - 13, "loading…" if snapshot.loading else snapshot.error or "no limits", 13, dim)
+            else:
+                for seconds, offset, cell_width in ((18000, 13, 5), (604800, 6, 6)):
+                    percent = self.quota(snapshot, seconds)
+                    color = self.color(3 if percent is not None and percent >= 90 else 2)
+                    self.at(row, right + login_width - offset, f"{percent:3.0f}%" if percent is not None else "   —", cell_width, color)
+        snapshot = usage.snapshot(selection.tool, selection.login) if selection.login else UsageSnapshot(error="No logins yet · a to add one")
+        detail = height - 11
+        self.put(detail, (selection.login or "No account selected") + (" · " + snapshot.email if snapshot.email else ""), curses.A_BOLD)
+        self.put(detail + 1, self.plain(snapshot.plan) or "Usage status", dim)
+        if snapshot.rows:
+            for y, (label, percent, reset, length) in enumerate(snapshot.rows[:3], detail + 2):
+                bar_width = min(18, max(8, width - 64))
+                self.at(y, 2, f"{label:12.12}  ", 14)
+                self.draw_usage_bar(y, 16, percent, reset, length, bar_width)
+                pace = self.plain(_pace(percent, _elapsed(reset, length), reset, length))
+                self.at(y, 16 + bar_width, f" {percent:3.0f}%  {pace}  resets in {self.plain(_until(reset))}", width - bar_width - 19,
+                        self.color(3 if percent >= 90 else 2))
+        else:
+            self.put(detail + 2, "Loading usage…" if snapshot.loading else snapshot.error or "No limits reported", dim)
+        notes = []
+        if snapshot.at:
+            age = int(max(0, time.time() - snapshot.at))
+            notes.append("updated just now" if age < 60 else f"cached · {self.plain(_until(time.time() + age))} ago")
+        if snapshot.loading:
+            notes.append("refreshing…")
+        if snapshot.error and snapshot.rows:
+            notes.append(snapshot.error)
+        if len(snapshot.rows) > 3:
+            notes.append("more limits in Manage → Usage details")
+        notes.append("bars: top usage / bottom time")
+        self.put(height - 6, " · ".join(notes), dim)
+        self.put(height - 5, f"[ Enter ↵ Launch ]  {selection.tool.bin.title()} · {selection.profile or '(none)'} history · {selection.login or '(none)'} account", curses.A_BOLD | accent)
+        self.put(height - 4, self.message, self.color(3))
+        self.put(height - 3, "p Profile   l Login   r Refresh usage   d Save defaults", dim)
+        self.put(height - 2, "n New profile  a Add login  e Rename  b Daemons  s Settings  o Setup  q Quit", dim)
+        self.screen.refresh()
+        return True
+
+    def login_menu(self, tool, name, usage):
+        while True:
+            selected = self.menu(f"{tool.bin} / Login {name}", ["Authenticate", "Usage details", "Delete login", "Back"])
+            if selected in (None, 3):
+                return
+            if selected == 0:
+                self.authenticate(tool, name)
+                usage.request(tool, name, force=True)
+            elif selected == 1:
+                snapshot = usage.snapshot(tool, name)
+                lines = [f"{label}: {percent:.0f}% · resets in {self.plain(_until(reset))}" for label, percent, reset, _ in snapshot.rows]
+                self.menu("Usage · " + name, lines or ["Loading…" if snapshot.loading else snapshot.error or "No limits reported"],
+                          self.plain(snapshot.plan))
+            elif selected == 2 and self.confirm(f"Delete login {name}?", "The account is removed. Conversation histories are kept."):
+                success, _ = self.attempt(delete_login, tool, name)
+                if success:
+                    self.message = f"Deleted login {name}"
+                    return
+
+    def run(self):
+        curses.curs_set(0)
+        self.screen.keypad(True)
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            for number, foreground in ((1, curses.COLOR_CYAN), (2, curses.COLOR_GREEN), (3, curses.COLOR_YELLOW)):
+                curses.init_pair(number, foreground, -1)
+            grey = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
+            number = 4
+            for severity, foreground in ((0, curses.COLOR_BLACK), (1, curses.COLOR_GREEN), (2, curses.COLOR_YELLOW), (3, curses.COLOR_RED)):
+                for gone in (False, True):
+                    curses.init_pair(number, foreground, grey if gone else curses.COLOR_BLACK)
+                    self.bar_colors[(severity, gone)] = number
+                    number += 1
+        except curses.error:
+            pass
+        if not Configuration.effective(read_cfg())["onboarding_complete"] and not any(profile_names(t) for t in TOOLS.values()) :
+            if not any(d.is_dir() for t in TOOLS.values() for d in (LOGINS / t.bin).glob("*/")):
+                self.onboarding()
+        selection, usage = LauncherSelection(self.tool.bin), AsyncUsage()
+        try:
+            self.screen.timeout(150)  # poll completed workers without blocking input/launch
+            while True:
+                selection.reload()
+                self.tool = selection.tool
+                # Selected account gets first priority, followed by the remaining rows.
+                accounts = list(dict.fromkeys([(selection.tool.bin, selection.login), *selection.accounts]))
+                for tool_name, name in accounts:
+                    if name is not None:
+                        usage.request(TOOLS[tool_name], name)
+                ready = self.draw_dashboard(selection, usage)
+                try:
+                    key = self.screen.get_wch()
+                except curses.error:
+                    continue
+                if key in ("q", "\x1b", "\x03"):
+                    return
+                if key in (curses.KEY_RESIZE, -1):
+                    continue
+                if not ready:
+                    continue
+                if key in ("p", "l"):
+                    selection.focus = "profile" if key == "p" else "login"
+                elif key == "\t":
+                    selection.focus = "login" if selection.focus == "profile" else "profile"
+                elif key in (curses.KEY_LEFT, "h"):
+                    selection.focus = "profile"
+                elif key == curses.KEY_RIGHT:
+                    selection.focus = "login"
+                elif key in (curses.KEY_UP, "k", curses.KEY_DOWN, "j"):
+                    selection.move(-1 if key in (curses.KEY_UP, "k") else 1)
+                elif key == "r":
+                    for tool_name, name in accounts:
+                        if name is not None:
+                            usage.request(TOOLS[tool_name], name, force=True)
+                    self.message = "Refreshing usage in the background"
+                elif key == "d":
+                    success, _ = self.attempt(selection.save_defaults)
+                    if success:
+                        self.message = "Profile and login defaults saved independently"
+                elif key in ("\n", "\r", curses.KEY_ENTER):
+                    if selection.profile and selection.login:
+                        self.terminal(self.run_agent, selection.tool, selection.profile, selection.login)
+                    else:
+                        self.message = "n Create a profile" if not selection.profile else "a Add a login"
+                elif key in ("n", "a", "m", "s", "e", "o", "b"):
+                    self.screen.timeout(-1)
+                    try:
+                        if key == "n":
+                            name = self.new_profile()
+                            if name:
+                                selection.profile = name
+                        elif key == "a":
+                            tools = list(TOOLS)
+                            index = self.menu("Add login · choose its agent", [name.title() for name in tools])
+                            if index is not None:
+                                tool = TOOLS[tools[index]]
+                                name = self.new_login(tool)
+                                if name:
+                                    selection.select_account(tool.bin, name)
+                                    usage.request(tool, name, force=True)
+                        elif key == "m":
+                            if selection.focus == "profile" and selection.profile:
+                                renamed = self.profile_menu(selection.tool, selection.profile)
+                                if renamed:
+                                    selection.profile = renamed
+                            elif selection.focus == "login" and selection.login:
+                                self.login_menu(selection.tool, selection.login, usage)
+                        elif key == "e" and selection.profile:
+                            selection.profile = self.rename_selected_profile(selection.tool, selection.profile)
+                        elif key == "o":
+                            self.onboarding()
+                        elif key == "b":
+                            self.daemons_view(daemons)
+                        else:
+                            self.settings(selection.tool, selection.profile) if selection.profile else self.settings()
+                    finally:
+                        self.screen.timeout(150)
+        finally:
+            self.screen.timeout(-1)
+            usage.close()  # Never wait for outstanding network requests.
+
+
+def open_tui(tool="claude"):
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise click.ClickException("The TUI needs an interactive terminal. Use silo --help for direct commands.")
+    try:
+        curses.wrapper(lambda screen: TerminalUI(screen, tool).run())
+    except KeyboardInterrupt:
+        return
+    except curses.error as e:
+        raise click.ClickException(f"Cannot open terminal UI: {e}") from e
+    except (ValueError, OSError) as e:
+        raise click.ClickException(str(e)) from e
+
+
+@cli.command()
+@click.pass_obj
+def tui(tool):
+    """Open profiles, login management and all settings in a terminal menu."""
+    open_tui(tool.bin)
+
+if __name__ == "__main__":
+    cli()

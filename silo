@@ -1135,8 +1135,8 @@ class Sandbox:
             b += gpg_binds(self.run.dir)
         return b
 
-    def argv(self):
-        wd = Path.cwd().resolve()
+    def argv(self, wd=None):
+        wd = Path(wd or Path.cwd()).resolve()
         if wd == HOME or wd in HOME.parents:                  # home itself, /home, /
             raise ValueError(f"run silo from a project directory: the working directory ({wd}) is mounted read-write")
         self.run.prepare()
@@ -1215,7 +1215,7 @@ class ops:
             return
         for run in p.runs():
             if run.login.exists() and p.h.daemon_alive(run.dir):
-                subprocess.run(Sandbox(p, run.login).argv() + [p.h.bin, *p.h.stop_daemon_cmd],
+                subprocess.run(Sandbox(p, run.login).argv(wd=run.dir) + [p.h.bin, *p.h.stop_daemon_cmd],
                                stdin=subprocess.DEVNULL, close_fds=False)
 
     @staticmethod
@@ -1276,6 +1276,31 @@ class ops:
         p, login = Profile(h, profile_name).require(), Login(h, login_name).require()
         p.set_login(login)
         return f"{h.name} profile [bold]{profile_name}[/] now runs as login [bold]{login_name}[/]"
+
+    @staticmethod
+    def login_rename(h, name, new_name):
+        """open sessions keep working: their sandbox binds the login dir itself, not its name."""
+        login, target = Login(h, name).require(), Login(h, new_name)
+        if target.exists():
+            raise ValueError(f"{h.name} login {new_name} already exists")
+        login.path.rename(target.path)
+        try:
+            def apply(raw):
+                raw["logins"] = {k: new_name if v == name and k.startswith(h.name + "/") else v
+                                 for k, v in raw.get("logins", {}).items()}
+                if raw.get("default_logins", {}).get(h.name) == name:
+                    raw["default_logins"] = {**raw["default_logins"], h.name: new_name}
+            Config.update(apply)
+        except BaseException:
+            target.path.rename(login.path)
+            raise
+        for runs in (RUNS / h.name).glob(f"*/{name}"):       # per-run /tmp etc. follow the login
+            if not (runs.parent / new_name).exists():
+                runs.rename(runs.parent / new_name)
+        cache = STATE / "usage" / f"{h.name}-{name}.json"
+        if cache.exists():
+            cache.rename(cache.with_name(f"{h.name}-{new_name}.json"))
+        return f"renamed {h.name} login {name} to {new_name}"
 
     @staticmethod
     def login_rm(h, name):
@@ -1808,6 +1833,15 @@ def login_use(h, profile_name, name):
     ok(call(ops.login_use, h, profile_name, name))
 
 
+@login.command("rename")
+@click.argument("name")
+@click.argument("new_name")
+@click.pass_obj
+def login_rename(h, name, new_name):
+    """Rename login NAME (open sessions keep running)."""
+    ok(call(ops.login_rename, h, name, new_name))
+
+
 @login.command("rm")
 @click.argument("name")
 @click.confirmation_option("-y", "--yes", prompt="Delete this login's credentials?")
@@ -2222,6 +2256,8 @@ class TerminalUI:
         self.screen, self.h = screen, HARNESSES[tool]
         self.message = ""
         self.bar_colors = {}
+        self.survey = None
+        self.show_keys = False
 
     def put(self, row, text, attr=0):
         height, width = self.screen.getmaxyx()
@@ -2410,6 +2446,9 @@ class TerminalUI:
         return name
 
     def rename_profile(self, h, name):
+        if Profile(h, name).daemon_logins() and not self.stop_daemon(h, name):
+            self.message = self.message or "Renaming needs the background daemon stopped"
+            return name
         new_name = self.prompt("Rename profile", name)
         if new_name is None or new_name == name:
             return name
@@ -2439,25 +2478,57 @@ class TerminalUI:
             if name and login:
                 Config.set_defaults(self.h, name, login)
 
+    def stop_daemon(self, h, name):
+        """stop the profile's background daemon, after saying what is still running on it."""
+        p = Profile(h, name)
+        daemons = p.daemon_logins()
+        if not daemons:
+            self.message = f"No daemon is running on {name}"
+            return False
+        sessions, procs, _ = self.survey.profile(h, name) if self.survey else ((), (), None)
+        pids = ", ".join(str(pid) for pid, _ in procs)
+        detail = (f"Daemon under {', '.join(daemons)}" + (f" (pid {pids})" if pids else "") + ". Its background agents stop too. "
+                  + (f"{len(sessions)} session{'s' * (len(sessions) != 1)} still open on this profile "
+                     f"({', '.join(sorted({l or '?' for _, l in sessions}))}); they lose their background agents."
+                     if sessions else "No sessions are open on this profile."))
+        if not self.confirm(f"Stop the background daemon of {name}?", detail):
+            return False
+        self.terminal(ops.stop_daemons, p)
+        self.message = f"Daemon of {name} stopped" if not p.daemon_logins() else f"The daemon of {name} is still running"
+        return not p.daemon_logins()
+
     def profile_menu(self, h, name):
         while True:
-            action = self.menu(f"{h.name} / Profile {name}", ["Rename profile", "Delete profile", "Back"],
+            items = ["Rename profile", "Delete profile"] + ["Stop background daemon"] * bool(Profile(h, name).daemon_logins())
+            action = self.menu(f"{h.name} / Profile {name}", items + ["Back"],
                                "Conversation history; account selection is independent")
-            if action in (None, 2):
+            if action is None or action == len(items):
                 return name
-            if action == 0:
+            if items[action] == "Rename profile":
                 name = self.rename_profile(h, name)
-            elif action == 1 and self.confirm(f"Delete profile {name}?", "Conversation history is deleted. Accounts are kept."):
+            elif items[action] == "Stop background daemon":
+                self.stop_daemon(h, name)
+            elif self.confirm(f"Delete profile {name}?", "Conversation history is deleted. Accounts are kept. "
+                              "Its background daemon is stopped first."):
                 self.terminal(ops.rm, h, name)
                 if not Profile(h, name).exists():
                     return None
 
+    def rename_login(self, h, name):
+        new_name = self.prompt("Rename login", name, "Open sessions keep running; new launches use the new name")
+        if new_name is None or new_name == name:
+            return name
+        return new_name if self.attempt(ops.login_rename, h, name, new_name)[0] else name
+
     def login_menu(self, h, name, usage):
+        """returns the login's name afterwards (None when deleted)."""
         while True:
-            selected = self.menu(f"{h.name} / Login {name}", ["Authenticate", "Usage details", "Delete login", "Back"])
-            if selected in (None, 3):
-                return
-            if selected == 0:
+            selected = self.menu(f"{h.name} / Login {name}", ["Authenticate", "Usage details", "Rename login", "Delete login", "Back"])
+            if selected in (None, 4):
+                return name
+            if selected == 2:
+                name = self.rename_login(h, name)
+            elif selected == 0:
                 self.authenticate(h, name)
                 usage.request(h, name, force=True)
             elif selected == 1:
@@ -2465,9 +2536,9 @@ class TerminalUI:
                 lines = [f"{r.label}: {r.percent:.0f}% · resets in {self.plain(_until(r.reset))}" for r in s.rows]
                 self.menu("Usage · " + name, lines or ["Loading…" if s.loading else s.error or "No limits reported"],
                           self.plain(s.plan))
-            elif selected == 2 and self.confirm(f"Delete login {name}?", "The account is removed. Conversation histories are kept."):
+            elif selected == 3 and self.confirm(f"Delete login {name}?", "The account is removed. Conversation histories are kept."):
                 if self.attempt(ops.login_rm, h, name)[0]:
-                    return
+                    return None
 
     def edit_list(self, title, value):
         draft = list(value)
@@ -2858,21 +2929,34 @@ class TerminalUI:
         warning = "⚠ " + ", ".join(f"{r.label} at {r.percent:.0f}%" + (" (used up)" if r.percent >= 100 else
                                     f", resets in {self.plain(_until(r.reset))}") for r in hot) if hot else ""
         self.put(height - 3, self.message or warning, self.color(3))
+        if self.show_keys:   # an overlay over the bottom of the dashboard, above the footer
+            columns = 4 if width >= 100 else 2
+            per_row = [self.KEYS[i:i + columns] for i in range(0, len(self.KEYS), columns)]
+            body = sum(1 + max(len(keys) for _, keys in row) for row in per_row) + len(per_row) - 1
+            top = max(4, height - 4 - body)
+            self.at(top, 0, "├─ keys " + "─" * (width - 9) + "┤", width, accent)
+            for y in range(top + 1, height - 2):
+                self.at(y, 1, " " * (width - 2), width - 2)
+            column_width, y = inner // columns, top + 1
+            for row in per_row:
+                for c, (title, keys) in enumerate(row):
+                    x = 3 + c * column_width
+                    self.at(y, x, title.upper(), column_width, bold | dim)
+                    for i, (key, what) in enumerate(keys, y + 1):
+                        self.at(i, x, f"{key:>2}", 2, bold | accent)
+                        self.at(i, x + 4, what, column_width - 5, 0)
+                y += 2 + max(len(keys) for _, keys in row)
         launch = f"⏎ launch {h.name} · {selection.profile or '(no profile)'} · {selection.login or '(no login)'}"
-        keys = "←→ profile  ↑↓ login  s settings  r refresh  ? keys  q quit"
+        keys = "? or esc closes keys" if self.show_keys else "←→ profile  ↑↓ login  s settings  r refresh  ? keys  q quit"
         self.at(height - 2, 2, launch, inner - len(keys) - 2, bold | accent)
         self.at(height - 2, width - 2 - len(keys), keys, len(keys), dim)
         self.screen.refresh()
         return True
 
-    KEYS = ["⏎      launch the selected profile with the selected login",
-            "←/→    profile        ↑/↓  login (switches agent with it)",
-            "n      new profile    a    add login",
-            "e      rename profile m    manage profile or login",
-            "s      settings (this profile's sandbox, or global defaults)",
-            "d      save profile + login as defaults",
-            "r      refresh usage  o    setup (import accounts/histories)",
-            "q      quit"]
+    KEYS = (("go", (("⏎", "launch"), ("←→", "profile"), ("↑↓", "login"), ("q", "quit"))),
+            ("create", (("n", "new profile"), ("a", "add login"), ("o", "setup · import"))),
+            ("change", (("e", "rename"), ("m", "manage · daemon"), ("s", "settings"), ("d", "save defaults"))),
+            ("usage", (("r", "refresh now"), ("?", "close this"))))
 
     def action(self, key, selection, usage):
         if key == "n":
@@ -2892,9 +2976,14 @@ class TerminalUI:
             if index is not None and items[index].startswith("Profile"):
                 selection.profile = self.profile_menu(selection.h, selection.profile) or selection.profile
             elif index is not None:
-                self.login_menu(selection.h, selection.login, usage)
-        elif key == "e" and selection.profile:
-            selection.profile = self.rename_profile(selection.h, selection.profile)
+                selection.login = self.login_menu(selection.h, selection.login, usage)
+        elif key == "e":
+            items = [f"Rename profile {selection.profile}"] * bool(selection.profile) + [f"Rename login {selection.login}"] * bool(selection.login)
+            index = self.menu("Rename", items) if items else None
+            if index is not None and items[index].startswith("Rename profile"):
+                selection.profile = self.rename_profile(selection.h, selection.profile)
+            elif index is not None:
+                selection.login = self.rename_login(selection.h, selection.login)
         elif key == "o":
             self.onboarding()
         elif key == "s":
@@ -2903,8 +2992,6 @@ class TerminalUI:
             index = self.menu("Settings", items, "Paths, SSH, GPG, brokered commands, resource limits, updates")
             if index is not None:
                 self.settings(selection.h, selection.profile) if items[index].startswith("Sandbox") else self.settings()
-        elif key == "?":
-            self.menu("Keys", self.KEYS)
 
     def run(self):
         curses.curs_set(0)
@@ -2914,6 +3001,7 @@ class TerminalUI:
                 and not any(Profile.all(h) or Login.all(h) for h in HARNESSES.values()):
             self.onboarding()
         selection, usage, survey = LauncherSelection(self.h.name), AsyncUsage(), Survey()
+        self.survey = survey
         try:
             self.screen.timeout(150)  # poll completed workers without blocking input/launch
             while True:
@@ -2928,10 +3016,14 @@ class TerminalUI:
                     key = self.screen.get_wch()
                 except curses.error:
                     continue
-                if key in ("q", "\x1b", "\x03"):
-                    return
                 if key in (curses.KEY_RESIZE, -1) or not ready:
                     continue
+                if self.show_keys or key == "?":       # the overlay takes the next key, then closes
+                    self.show_keys = key == "?" and not self.show_keys
+                    if key in ("?", "\x1b"):
+                        continue
+                if key in ("q", "\x1b", "\x03"):
+                    return
                 if key in (curses.KEY_LEFT, "h", curses.KEY_RIGHT, "l"):
                     selection.move_profile(-1 if key in (curses.KEY_LEFT, "h") else 1)
                 elif key in (curses.KEY_UP, "k", curses.KEY_DOWN, "j"):
@@ -2948,7 +3040,7 @@ class TerminalUI:
                         self.terminal(ops.run, selection.h, selection.profile, selection.login)
                     else:
                         self.message = "n creates a profile" if not selection.profile else "a adds a login"
-                elif key in ("n", "a", "m", "s", "e", "o", "?"):
+                elif key in ("n", "a", "m", "s", "e", "o"):
                     self.screen.timeout(-1)
                     try:
                         self.action(key, selection, usage)

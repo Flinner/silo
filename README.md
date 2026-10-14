@@ -1,6 +1,6 @@
 <div align="center">
 
-![silo — many accounts, any history, every agent CLI sandboxed with bubblewrap](assets/banner.png)
+![silo — many accounts, any history, every agent CLI sandboxed with bubblewrap](assets/banner-v2.png)
 
 **One Python file. Accounts and histories mixed freely. Every agent CLI in its own bubblewrap sandbox.**
 

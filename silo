@@ -1480,11 +1480,13 @@ def _elapsed(reset, length):
 
 
 def _bar(p, el, w=14):
-    """two bars in one row of half blocks: usage on top, time gone underneath."""
+    """a solid usage bar; ┃ marks how much of the window's time is gone."""
     n = round(min(p, 100) / 100 * w)
-    t = round(el * w) if el is not None else 0
     c = "red" if p >= 90 else "yellow" if p >= 70 else "green"
-    return "".join(f"[{c if i < n else 'grey23'} on {'grey62' if i < t else 'grey23'}]▀[/]" for i in range(w)) + f" {p:3.0f}%"
+    cells = [f"[{c}]━[/]"] * n + ["[grey35]─[/]"] * (w - n)
+    if el is not None and el < 1:
+        cells[min(w - 1, round(el * w))] = "[bold cyan]┃[/]"
+    return "".join(cells) + f" [bold {c}]{p:3.0f}%[/]"
 
 
 def _pace(p, el, reset, length):
@@ -1963,7 +1965,7 @@ def status(h, every):
             el = _elapsed(r.reset, r.length)
             t.add_row(f"  {r.label}", _bar(r.percent, el, w), _pace(r.percent, el, r.reset, r.length), _until(r.reset))
         out.print(t)
-    out.print("[dim]bars: top = used, bottom = time gone[/]")
+    out.print("[dim]bars: fill = used, ┃ = time gone in the window[/]")
 
 
 @cli.command("check-update")
@@ -2255,7 +2257,6 @@ class TerminalUI:
     def __init__(self, screen, tool):
         self.screen, self.h = screen, HARNESSES[tool]
         self.message = ""
-        self.bar_colors = {}
         self.survey = None
         self.show_keys = False
 
@@ -2745,36 +2746,30 @@ class TerminalUI:
         try:
             curses.start_color()
             curses.use_default_colors()
-            for number, foreground in ((1, curses.COLOR_CYAN), (2, curses.COLOR_GREEN), (3, curses.COLOR_YELLOW)):
+            for number, foreground in ((1, curses.COLOR_CYAN), (2, curses.COLOR_GREEN), (3, curses.COLOR_YELLOW),
+                                       (4, curses.COLOR_RED)):
                 curses.init_pair(number, foreground, -1)
-            grey = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
-            number = 4
-            for severity, foreground in ((0, curses.COLOR_BLACK), (1, curses.COLOR_GREEN), (2, curses.COLOR_YELLOW), (3, curses.COLOR_RED)):
-                for gone in (False, True):
-                    curses.init_pair(number, foreground, grey if gone else curses.COLOR_BLACK)
-                    self.bar_colors[(severity, gone)] = number
-                    number += 1
         except curses.error:
             pass
 
     STALE = 2 * USAGE_TTL    # seconds before cached usage is shown dimmed
 
+    def severity(self, percent):
+        return self.color(4 if percent >= 90 else 3 if percent >= 70 else 2)
+
     def draw_usage_bar(self, row, column, r, width, dimmed=False):
+        """a solid usage bar; ┃ marks how much of the window's time is gone (fill past it = ahead of pace)."""
         used = round(max(0, min(r.percent, 100)) / 100 * width)
+        fill = curses.A_DIM if dimmed else self.severity(r.percent)
+        self.at(row, column, "━" * used, used, fill)
+        self.at(row, column + used, "─" * (width - used), width - used, curses.A_DIM)
         elapsed = _elapsed(r.reset, r.length)
-        gone = round(elapsed * width) if elapsed is not None else 0
-        severity = 3 if r.percent >= 90 else 2 if r.percent >= 70 else 1
-        for cell in range(width):
-            top, bottom = cell < used, cell < gone
-            pair = None if dimmed else self.bar_colors.get((severity if top else 0, bottom))
-            if pair is not None:
-                glyph, attr = "▀", self.color(pair)
-            else:
-                glyph, attr = ("█" if top and bottom else "▀" if top else "▄" if bottom else "░"), curses.A_DIM if dimmed else 0
-            self.at(row, column + cell, glyph, 1, attr)
+        if elapsed is not None and r.reset > time.time():
+            mark = min(width - 1, round(elapsed * width))
+            self.at(row, column + mark, "┃", 1, curses.A_DIM if dimmed else curses.A_BOLD | (self.color(1) if mark >= used else 0))
 
     def pct_attr(self, percent, dimmed):
-        return curses.A_DIM if dimmed else self.color(3 if percent >= 90 else 2)
+        return curses.A_DIM if dimmed else self.severity(percent) | curses.A_BOLD
 
     def draw_cells(self, y, x, rows, label_width, bar, dimmed):
         """every window of a login on one row, in slots that line up across rows: label, two-tone bar, percent."""
@@ -2840,7 +2835,7 @@ class TerminalUI:
         # detail block for the selected login, sized first so the list gets the rest
         s = usage.snapshot(h, selection.login) if selection.login else UsageSnapshot(error="No logins yet · a adds one")
         logged_in = bool(selection.login) and Login(h, selection.login).logged_in() and s.error != "not logged in"
-        detail_rows = 3 + max(1, len(s.rows))
+        detail_rows = 3 + max(1, 2 * len(s.rows) - 1)
         rows = []
         for hh in HARNESSES.values():
             members = [a for a in selection.accounts if a[0] == hh.name]
@@ -2848,11 +2843,18 @@ class TerminalUI:
                 rows.append((hh.name, None))
                 rows.extend(members or [(hh.name, "")])
         list_top = 4
-        list_end = min(list_top + len(rows), height - 4 - detail_rows - 1)   # the detail follows the list
+        room = height - 4 - detail_rows - 1 - list_top
+        visible = max(1, min(len(rows), room - sum(1 for _, n in rows if n is None) + 1))
         current = (h.name, selection.login)
         index = rows.index(current) if current in rows else 0
-        visible = max(1, list_end - list_top)
         start = max(0, min(index - visible + 1, len(rows) - visible))
+        ys, y = [], list_top
+        for i, (_, name) in enumerate(rows[start:start + visible]):
+            if i and name is None:
+                y += 1                                         # a blank line before each tool heading
+            ys.append(y)
+            y += 1
+        list_end = y
         _, daemons, _ = survey.profile(h, selection.profile) if selection.profile else ((), (), None)
         sessions = survey.profile(h, selection.profile)[0] if selection.profile else ()
         # one grid for every row and every frame, so nothing moves while you browse
@@ -2861,9 +2863,9 @@ class TerminalUI:
         windows = [r for snap in snaps.values() for r in snap.rows]
         label_width = min(10, max([2] + [len(r.label) for r in windows]))
         slots = max([2] + [len(snap.rows) for snap in snaps.values()])
-        cells_x = 5 + name_width + 18
-        bar = max(0, min(12, (width - 6 - cells_x) // slots - label_width - 8))
-        for y, (tool, name) in enumerate(rows[start:start + visible], list_top):
+        cells_x, marks_width = 5 + name_width, 20             # marks (default, ● bg, open) sit at the right edge
+        bar = max(0, min(14, (width - 6 - marks_width - cells_x) // slots - label_width - 8))
+        for (tool, name), y in zip(rows[start:start + visible], ys):
             if name is None:
                 self.at(y, 2, tool.upper(), inner, bold | dim)
                 continue
@@ -2874,14 +2876,14 @@ class TerminalUI:
             default = name == Config.defaults(hh)[1]
             label = name if len(name) <= name_width else name[:name_width - 1] + "…"
             self.at(y, 2, ("› " if chosen else "  ") + label, name_width + 2, bold | accent if chosen else 0)
-            x = 5 + name_width
-            marks = ("default " if default else "")
+            marks = ["default"] if default else []
             if tool == h.name:
                 if any(l == name for _, l in daemons):
-                    marks += "● bg "
+                    marks.append("● bg")
                 if n := sum(1 for _, l in sessions if l == name):
-                    marks += f"{n} open "
-            self.at(y, x, marks, 18, dim)
+                    marks.append(f"{n} open")
+            marks = " · ".join(marks)
+            self.at(y, width - 6 - len(marks), marks, len(marks), dim)
             x = cells_x
             snap = snaps[(tool, name)]
             logged = Login(hh, name).logged_in() and snap.error != "not logged in"
@@ -2891,7 +2893,7 @@ class TerminalUI:
             elif snap.rows:
                 self.draw_cells(y, x, snap.rows, label_width, bar, stale)
                 if any(r.percent >= 90 for r in snap.rows) and not stale:
-                    self.at(y, width - 4, "⚠", 1, self.color(3))
+                    self.at(y, width - 4, "⚠", 1, self.color(4) | bold)
             else:
                 self.at(y, x, "loading…" if snap.loading else snap.error or "no limits reported", inner - x, dim)
 
@@ -2915,7 +2917,8 @@ class TerminalUI:
         self.at(y + 2, 2, " · ".join(state) or "Loading usage…", inner, self.color(3) if not logged_in or s.error else dim)
         dimmed = not logged_in or (age or 0) > self.STALE
         bar_width = min(24, max(8, width - 70))
-        for row, r in enumerate(s.rows, y + 3):
+        for i, r in enumerate(s.rows):
+            row = y + 3 + 2 * i
             if row >= height - 4:
                 break
             self.at(row, 2, f"{r.label:12.12}", 12, dim)

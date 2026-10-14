@@ -116,14 +116,22 @@ silo status -a                      # 5h / weekly / per-model limits of every lo
 ```console
 $ silo status -a
 main claude  me@university.edu
+  Max 20x · ~$200/mo list · renews ~Oct 28 2026
   5h        ▀▀▀▀▀▀▀▀▀▀▀▀▀▀  29%  slow -22%               2h 27m
   7d        ▀▀▀▀▀▀▀▀▀▀▀▀▀▀  80%  fast +64% · out in 1d   5d 19h
   7d Opus   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀ 100%  used up                 5d 19h
 main codex  me@example.org
+  Plus · ~$20/mo list · paid until Nov 17 2026
   5h        ▀▀▀▀▀▀▀▀▀▀▀▀▀▀   0%  new window              4h 59m
   7d        ▀▀▀▀▀▀▀▀▀▀▀▀▀▀  12%  on pace                 5d 23h
 bars: top = used, bottom = time gone
 ```
+
+Under each login: its plan, the plan's list price (what you pay may differ —
+taxes, region, discounts) and when it renews or is paid until. Claude reports
+only when the subscription started, so its renewal is the next monthly
+anniversary (`~`); codex's date comes from the login token and is marked stale
+once past, until a run refreshes the token.
 
 Each bar is two in one row of half blocks: the top half (green, yellow, red)
 is how much you have used, the bottom half (grey) how much of the window has

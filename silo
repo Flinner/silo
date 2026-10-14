@@ -133,6 +133,7 @@ class Tool:
     setenv: dict = field(default_factory=dict)
     stop: list = field(default_factory=list)   # args to stop its background daemon before rm
     usage: object = None          # fn(login_dir) -> [(window, percent used, reset epoch)]
+    plan: object = None           # fn(login_dir) -> one line: plan, list price, renewal/expiry
 
     def current_email(self):
         return self.email(self.home) if self.email else None
@@ -148,11 +149,12 @@ TOOLS = {
                    # default config dir keeps its state in ~/.claude.json (a ~/.claude/.claude.json is stale)
                    email=lambda d: claude_email(HOME if d == HOME / ".claude" else d),
                    binds=claude_binds, setenv={"DISABLE_AUTOUPDATER": "1"}, stop=["daemon", "stop", "--any"],
-                   usage=lambda d: claude_usage(d)),
+                   usage=lambda d: claude_usage(d), plan=lambda d: claude_plan(d)),
     "codex": Tool("codex", "CODEX_HOME", HOME / ".codex",
                   copy=["config.toml"], link=["AGENTS.md"],
                   login=[HOME / ".codex/auth.json"], cred="auth.json", login_cmd="login",
-                  email=lambda d: jwt_email(d / "auth.json"), usage=lambda d: codex_usage(d)),
+                  email=lambda d: jwt_email(d / "auth.json"), usage=lambda d: codex_usage(d),
+                  plan=lambda d: codex_plan(d)),
 }
 ALIASES = {"silo": "claude", "silo-codex": "codex"}  # argv[0] -> default tool
 
@@ -1221,6 +1223,60 @@ def claude_usage(d):
 
 
 WINDOW_SECS = {"5h": 5 * 3600, "7d": 7 * 86400}
+# list prices (USD/month) for plans the endpoints name; what you actually pay may differ
+PRICES = {"default_claude_max_20x": ("Max 20x", 200), "default_claude_max_5x": ("Max 5x", 100),
+          "claude_pro": ("Pro", 20), "pro": ("Pro", 20), "max": ("Max", None),
+          "plus": ("Plus", 20), "chatgpt_pro": ("Pro", 200), "team": ("Team", 30), "business": ("Business", 30),
+          "enterprise": ("Enterprise", None), "free": ("Free", 0)}
+
+
+def _date(ts):
+    return time.strftime("%b %-d %Y", time.localtime(ts))
+
+
+def _plan_line(key, status, ends, label_end):
+    name, price = PRICES.get(key, (key.replace("_", " ").title() if key else "?", None))
+    bits = [name, f"~${price}/mo list" if price else None, status]
+    if ends:
+        sep = "" if label_end.endswith("~") else " "
+        bits.append(f"{label_end}{sep}{_date(ends)}" if ends > time.time()
+                    else f"[yellow]{label_end}{sep}{_date(ends)} (stale; a run refreshes it)[/]")
+    return " · ".join(b for b in bits if b)
+
+
+def claude_plan(d):
+    tok = json_file(d / ".credentials.json").get("claudeAiOauth", {}).get("accessToken")
+    if not tok:
+        return None
+    o = get_json("https://api.anthropic.com/api/oauth/profile",
+                 {"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"}).get("organization") or {}
+    key = o.get("rate_limit_tier") if o.get("rate_limit_tier") in PRICES else o.get("organization_type", "")
+    renew = None
+    if o.get("billing_type") == "stripe_subscription" and o.get("subscription_created_at"):
+        from datetime import datetime    # monthly anniversary of the start: an estimate, the API has no renewal date
+        st = datetime.fromisoformat(o["subscription_created_at"].replace("Z", "+00:00"))
+        now = datetime.now(st.tzinfo)
+        m = now.year * 12 + now.month - 1 + (now.day >= st.day)
+        renew = st.replace(year=m // 12, month=m % 12 + 1, day=min(st.day, 28)).timestamp()
+    status = o.get("subscription_status")
+    trial = o.get("claude_code_trial_ends_at")
+    line = _plan_line(key, None if status == "active" else status, renew, "renews ~")
+    return line + (f" · trial ends {_date(_epoch(trial))}" if trial else "")
+
+
+def codex_plan(d):
+    tok = (json_file(d / "auth.json").get("tokens") or {}).get("id_token", "")
+    try:
+        p = tok.split(".")[1]
+        a = json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4))).get("https://api.openai.com/auth", {})
+    except Exception:
+        return None
+    plan = a.get("chatgpt_plan_type")
+    until = a.get("chatgpt_subscription_active_until")
+    return _plan_line("chatgpt_pro" if plan == "pro" else plan, None, _epoch(until) if until else None,
+                      "paid until") if plan else None
+
+
 CLAUDE_OAUTH = ("https://platform.claude.com/v1/oauth/token", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
 
 
@@ -1356,17 +1412,24 @@ def status(tool, every):
     res = [None] * len(jobs)
 
     age = [None] * len(jobs)
+    plans = [None] * len(jobs)
 
     def fetch(i, tl, d):   # cached a minute; when the endpoint refuses (e.g. 429), the last answer
         f = STATE / "usage" / f"{tl.bin}-{jobs[i][1]}.json"
         cache = json_file(f)
         if cache and time.time() - cache["at"] < 60:
             res[i] = [tuple(x) for x in cache["rows"]]
+            plans[i] = cache.get("plan")
             return
+        if tl.plan:
+            try:
+                plans[i] = tl.plan(d)
+            except RuntimeError:
+                plans[i] = cache.get("plan")
         try:
             res[i] = tl.usage(d)
             f.parent.mkdir(parents=True, exist_ok=True)
-            write_json(f, {"at": time.time(), "rows": res[i]})
+            write_json(f, {"at": time.time(), "rows": res[i], "plan": plans[i]})
         except RuntimeError as e:
             res[i] = [tuple(x) for x in cache["rows"]] if cache and "HTTP" in str(e) else str(e)
             age[i] = cache and time.time() - cache["at"]
@@ -1378,10 +1441,12 @@ def status(tool, every):
             t.join()
     # one heading per login, then a short row per window: fits narrow terminals (the bar shrinks)
     w = max(5, min(20, out.width - 54))
-    for (tl, name, d), r, a in zip(jobs, res, age):
+    for (tl, name, d), r, a, pl in zip(jobs, res, age, plans):
         email = (tl.email and tl.email(d)) or ""
         stale = f"  [yellow](from {_until(time.time() + a)} ago)[/]" if a and isinstance(r, list) else ""
         out.print(f"[bold]{name}[/] [dim]{tl.bin}  {email}[/]{stale}", overflow="ellipsis", no_wrap=True)
+        if pl:
+            out.print(f"  [cyan]{pl}[/]", overflow="ellipsis", no_wrap=True)
         if isinstance(r, str) or not r:
             out.print(f"  [yellow]{r or 'no limits reported'}[/]")
             continue

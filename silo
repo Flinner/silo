@@ -3,7 +3,7 @@
 
 https://github.com/flinner/silo  -  MIT License
 """
-import base64, fnmatch, urllib.request, json, os, re, select, shutil, signal, socket, subprocess, sys, threading, time
+import base64, fnmatch, urllib.request, urllib.error, json, os, re, select, shutil, signal, socket, subprocess, sys, threading, time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,15 +20,17 @@ except ImportError as e:
 if not shutil.which("bwrap"):
     sys.exit("silo: bubblewrap (bwrap) is not installed; see https://github.com/flinner/silo#install")
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/silo/main/silo"
 
 HOME = Path.home()
 ROOT = Path(os.environ.get("SILO_ROOT", HOME / ".config/silo"))  # ROOT/<tool>/<profile>
+LOGINS = ROOT / "logins"                                          # LOGINS/<tool>/<login>
 CONFIG = ROOT / "config.json"                                     # written by `init`
 DEFAULTS = {"ssh_keys": [], "ssh_config": False, "ssh_hosts": [], "writable": [], "check_updates": "ask",
             "nice": 10, "ionice": "idle", "memory_max": "", "swap_max": "",
             "readable": [], "path_dirs": True, "git_config": True, "gpg": False,
+            "logins": {},   # "tool/profile": login, when it is not the profile's own name
             "brokered": {"gh": ["pr", "issue", "run list", "run view", "run watch", "run rerun",
                                 "run download", "workflow list", "workflow view", "workflow run",
                                 "repo view", "repo clone", "release list", "release view", "search",
@@ -47,8 +49,8 @@ die = lambda m: (err.print(f"[red]✗[/] {m}"), sys.exit(1))
 # Bump CONFIG_VERSION minor for added keys (older silo warns, keeps going), major for
 # incompatible changes (older silo refuses); CONFIG_MIN_SILO is the silo release that
 # introduced the current schema.
-CONFIG_VERSION = "1.1"
-CONFIG_MIN_SILO = "0.5.0"
+CONFIG_VERSION = "1.2"
+CONFIG_MIN_SILO = "0.6.0"
 META = ("config_version", "silo_min_version")
 
 
@@ -121,13 +123,16 @@ class Tool:
     home: Path                    # the tool's default config dir, seeded from
     copy: list = field(default_factory=list)   # files copied into a new profile (tool edits them)
     link: list = field(default_factory=list)   # files symlinked into a new profile (shared)
-    login: list = field(default_factory=list)  # files copied by `new --current`
-    cred: str = ""                # file whose presence means "logged in"
+    login: list = field(default_factory=list)  # this machine's login files (always hidden)
+    cred: str = ""                # credential file: lives in the login store, symlinked into the profile
+    cred_env: str = ""            # env var relocating just the credential dir: per-run, no link in the profile
+    acct: tuple = ()              # (key, state file name, this machine's state file): account record kept with the login
     login_cmd: str = ""           # how to log in
     email: object = None          # fn(config_dir) -> email or None
     binds: object = None          # fn(profile_dir) -> extra bwrap args
     setenv: dict = field(default_factory=dict)
     stop: list = field(default_factory=list)   # args to stop its background daemon before rm
+    usage: object = None          # fn(login_dir) -> [(window, percent used, reset epoch)]
 
     def current_email(self):
         return self.email(self.home) if self.email else None
@@ -138,19 +143,23 @@ TOOLS = {
                    copy=["settings.json"], link=["CLAUDE.md", "AGENTS.md", "skills"],
                    login=[HOME / ".claude/.credentials.json", HOME / ".claude.json"],
                    cred=".credentials.json", login_cmd="auth login",
+                   cred_env="CLAUDE_SECURESTORAGE_CONFIG_DIR",   # claude refuses a symlinked credential file
+                   acct=("oauthAccount", ".claude.json", HOME / ".claude.json"),
                    # default config dir keeps its state in ~/.claude.json (a ~/.claude/.claude.json is stale)
                    email=lambda d: claude_email(HOME if d == HOME / ".claude" else d),
-                   binds=claude_binds, setenv={"DISABLE_AUTOUPDATER": "1"}, stop=["daemon", "stop", "--any"]),
+                   binds=claude_binds, setenv={"DISABLE_AUTOUPDATER": "1"}, stop=["daemon", "stop", "--any"],
+                   usage=lambda d: claude_usage(d)),
     "codex": Tool("codex", "CODEX_HOME", HOME / ".codex",
                   copy=["config.toml"], link=["AGENTS.md"],
                   login=[HOME / ".codex/auth.json"], cred="auth.json", login_cmd="login",
-                  email=lambda d: jwt_email(d / "auth.json")),
+                  email=lambda d: jwt_email(d / "auth.json"), usage=lambda d: codex_usage(d)),
 }
 ALIASES = {"silo": "claude", "silo-codex": "codex"}  # argv[0] -> default tool
 
 ABOUT = """\
-Profiles live in [cyan]~/.config/agents/TOOL/NAME[/], each its own config dir
-({envs}), so any number run at once.  Claude profiles share the session
+Profiles (histories) live in [cyan]~/.config/silo/TOOL/NAME[/], each its own config dir
+({envs}), so any number run at once.  Logins (accounts) live apart in [cyan]~/.config/silo/logins[/];
+a profile runs with the login of its own name unless [bold]login use[/] or [bold]--login[/] picks another.  Claude profiles share the session
 registry of [cyan]~/.claude[/], so sessions (sandboxed or not, any account) can list and message each other.
 
 [bold]Tools[/]    {tools}.  Pick with [bold]-t[/], or by alias: {aliases}.
@@ -167,6 +176,7 @@ EXAMPLES = """\
 [dim]$[/] silo new work && silo work auth login
 [dim]$[/] silo work                      [dim]# interactive claude session as 'work'[/]
 [dim]$[/] silo work -c                   [dim]# any claude flag passes through[/]
+[dim]$[/] silo work --login main -c      [dim]# work's history, main's account[/]
 [dim]$[/] silo work --bg 'refactor X'    [dim]# background agent, survives exit[/]
 [dim]$[/] silo work --remote-control
 [dim]$[/] silo -t codex new main --current   [dim]# codex profile  (or the silo-codex alias)[/]
@@ -217,6 +227,77 @@ def profile(tool, name):
     if not d.is_dir():
         die(f"no {tool.bin} profile [bold]{name}[/]  (see [cyan]ls[/] / [cyan]new[/])")
     return d
+
+
+# ---- logins: credentials live in LOGINS/<tool>/<login>, apart from a profile's history ----
+def login_of(tool, name):
+    """the login profile NAME runs with by default (its own name unless `login use` changed it)."""
+    return load_cfg()["logins"].get(f"{tool.bin}/{name}", name)
+
+
+def set_login(tool, name, login):
+    raw = read_cfg()
+    m = {k: v for k, v in raw.get("logins", {}).items() if k != f"{tool.bin}/{name}"}
+    raw["logins"] = {**m, f"{tool.bin}/{name}": login} if login != name else m
+    save_cfg(raw)
+
+
+def login_users(tool, login):
+    return [p.name for p in sorted((ROOT / tool.bin).glob("*/")) if login_of(tool, p.name) == login]
+
+
+def json_file(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json(path, data):
+    tmp = Path(f"{path}.silo-tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def import_login(tool, login):
+    """copy this machine's current login into the store as LOGIN."""
+    ld = LOGINS / tool.bin / login
+    ld.mkdir(parents=True, exist_ok=True, mode=0o700)
+    shutil.copy2(tool.home / tool.cred, ld)
+    if tool.acct and (a := json_file(tool.acct[2]).get(tool.acct[0])):
+        write_json(ld / tool.acct[1], {tool.acct[0]: a})
+
+
+def attach(tool, name, d, login):
+    """point profile NAME at LOGIN for one run: the tool reads its credentials from the login's dir
+    (via cred_env, else a symlink in the profile) and the account record is swapped in.  What the previous run left behind goes back to the login it used."""
+    last_f = STATE / "logins" / f"{tool.bin}-{name}"
+    try:
+        last = last_f.read_text().strip()
+    except OSError:
+        last = login_of(tool, name)
+    old = LOGINS / tool.bin / last
+    cred = d / tool.cred
+    if cred.exists() and not cred.is_symlink():          # pre-0.6 profile, or the tool replaced the link
+        old.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.move(cred, old / tool.cred)
+    ld = LOGINS / tool.bin / login
+    ld.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if tool.acct:
+        key, fn, _ = tool.acct
+        state = json_file(d / fn)
+        if state.get(key) and old.is_dir() and not json_file(old / fn).get(key):   # a fresh login's record
+            write_json(old / fn, {key: state[key]})
+        if (d / fn).exists() or json_file(ld / fn):
+            acct = json_file(ld / fn).get(key)
+            write_json(d / fn, {**state, key: acct} if acct else {k: v for k, v in state.items() if k != key})
+    if cred.is_symlink():
+        cred.unlink()
+    if not tool.cred_env:
+        cred.symlink_to(ld / tool.cred)
+    last_f.parent.mkdir(parents=True, exist_ok=True)
+    last_f.write_text(login)
+    return ["--bind", ld, ld] + (["--setenv", tool.cred_env, ld] if tool.cred_env else [])
 
 
 def daemon_alive(d):
@@ -497,9 +578,9 @@ def under(path, roots):
     return any(path == r or r in path.parents for r in roots)
 
 
-def sandbox(tool, name):
-    """bwrap argv (without the command) for profile NAME of TOOL.  Home is an empty tmpfs:
-    only the cwd, the profile, `writable` (rw) and `readable`, PATH dirs, git config (ro) exist."""
+def sandbox(tool, name, login=None):
+    """bwrap argv (without the command) for profile NAME of TOOL, logged in as LOGIN.  Home is an empty
+    tmpfs: only the cwd, the profile, its login, `writable` (rw) and `readable`, PATH dirs, git config (ro) exist."""
     cfg = load_cfg()
     d = profile(tool, name)
     wd = Path.cwd().resolve()
@@ -538,10 +619,11 @@ def sandbox(tool, name):
     # secrets inside anything mapped back: every tool's login files (all accounts) + `hidden`
     seen = rw + [r[1] if isinstance(r, tuple) else r for r in ro]
     for f in [*(x for t in TOOLS.values() for x in t.login), *(Path(h).expanduser() for h in cfg["hidden"]),
-              HOME / ".ssh", ROOT / "config.json"]:
+              HOME / ".ssh", ROOT / "config.json", LOGINS]:
         f = Path(f)
         if under(f, seen) and f.exists() and not under(d, [f]):
             b += ["--tmpfs", f] if f.is_dir() else ["--ro-bind", "/dev/null", f]
+    b += attach(tool, name, d, login or login_of(tool, name))   # after the masks: only this login is visible
 
     rt = rtdir(tool, name)                                 # roots the broker accepts as cwd
     try:
@@ -569,8 +651,9 @@ def sandbox(tool, name):
     return [str(x) for x in b]
 
 
-def create(tool, name, current):
+def create(tool, name, current, login=None):
     d = ROOT / tool.bin / name
+    login = login or name
     if d.exists():
         die(f"{tool.bin} profile [bold]{name}[/] already exists")
     d.mkdir(parents=True, mode=0o700)
@@ -580,10 +663,16 @@ def create(tool, name, current):
     for f in tool.link:   # shared with the tool's main config
         if (tool.home / f).exists():
             (d / f).symlink_to(tool.home / f)
+    if login != name:
+        set_login(tool, name, login)
     if current:
-        for f in tool.login:
-            shutil.copy2(f, d)
-        ok(f"created {tool.bin} profile [bold]{name}[/] with the current login")
+        for f in tool.login:   # the tool's state (project trust etc.) seeds the profile; credentials go to the login
+            if f.name != tool.cred:
+                shutil.copy2(f, d)
+        import_login(tool, login)
+        ok(f"created {tool.bin} profile [bold]{name}[/] with the current login as login [bold]{login}[/]")
+    elif (LOGINS / tool.bin / login / tool.cred).exists():
+        ok(f"created {tool.bin} profile [bold]{name}[/] using login [bold]{login}[/]")
     else:
         ok(f"created {tool.bin} profile [bold]{name}[/]  -  now run:  [cyan]{Path(sys.argv[0]).name} {name} {tool.login_cmd}[/]")
 
@@ -724,26 +813,26 @@ def init():
                     "value, Tab completes.  Change one setting later with [cyan]silo config KEY VALUE[/].",
                     title="silo init", border_style="cyan"))
 
-    out.rule("[bold]1. Logins → profiles[/]")
+    out.rule("[bold]1. Logins[/]")
     for tool in TOOLS.values():
         if not (tool.home / tool.cred).exists():
             out.print(f"  [dim]{tool.bin}: not logged in on this machine[/]")
             continue
-        have = sorted(p.name for p in (ROOT / tool.bin).glob("*/"))
+        have = sorted(p.name for p in (LOGINS / tool.bin).glob("*/"))
         out.print(f"  [bold]{tool.bin}[/]: logged in as [green]{tool.current_email() or '?'}[/]"
-                  + (f"   [dim](profiles: {', '.join(have)})[/]" if have else ""))
-        if click.confirm(f"  import this {tool.bin} login as a profile?", default=not have):
-            name = ask("    profile name (existing = replace its login, empty = skip):",
+                  + (f"   [dim](logins: {', '.join(have)})[/]" if have else ""))
+        if click.confirm(f"  import this {tool.bin} login?", default=not have):
+            name = ask("    login name (existing = replace it, empty = skip):",
                        default="" if "main" in have else "main", words=have)
             if not name:
                 out.print("    [dim]skipped[/]")
-            elif name not in have:
-                create(tool, name, current=True)
-            elif click.confirm(f"    replace the login of profile '{name}' "
-                               f"({tool.email(ROOT / tool.bin / name) or '?'}) with this one?", default=False):
-                for f in tool.login:
-                    shutil.copy2(f, ROOT / tool.bin / name)
-                ok(f"{tool.bin} profile [bold]{name}[/] now uses the current login")
+            elif not (ROOT / tool.bin / name).is_dir():
+                create(tool, name, current=True)                  # a profile of the same name uses it
+            elif name not in have or click.confirm(
+                    f"    replace login '{name}' ({tool.email(LOGINS / tool.bin / name) or '?'}) with this one?",
+                    default=False):
+                import_login(tool, name)
+                ok(f"{tool.bin} login [bold]{name}[/] is now the current login")
 
     out.rule("[bold]2. Filesystem[/]")
     out.print("  Your home is [bold]empty[/] in the sandbox (a scratch tmpfs).  The working directory and the\n"
@@ -837,8 +926,15 @@ def init():
 @click.argument("args", nargs=-1, type=click.UNPROCESSED)
 @click.pass_obj
 def run(tool, name, args):
-    cmd = [os.environ.get("SHELL", "/bin/sh")] if list(args) == ["--shell"] else [tool.bin, *args]
-    argv = limits(load_cfg()) + sandbox(tool, name) + cmd
+    args, login = list(args), None
+    if args[:1] == ["--login"] and len(args) > 1:
+        login, args = args[1], args[2:]
+    elif args[:1] and args[0].startswith("--login="):
+        login, args = args[0].split("=", 1)[1], args[1:]
+    if login and not (LOGINS / tool.bin / login).is_dir():
+        die(f"no {tool.bin} login [bold]{login}[/]  (see [cyan]login ls[/] / [cyan]login add[/])")
+    cmd = [os.environ.get("SHELL", "/bin/sh")] if args == ["--shell"] else [tool.bin, *args]
+    argv = limits(load_cfg()) + sandbox(tool, name, login) + cmd
     os.execvp(argv[0], argv)
 
 
@@ -878,14 +974,16 @@ def _broker(tool, name):
 def ls(tool, every):
     """List profiles."""
     t = Table(box=None, padding=(0, 2), header_style="bold")
-    for c in ("Tool", "Profile", "Account", "Login", "Background"):
+    for c in ("Tool", "Profile", "Login", "Account", "Background"):
         t.add_column(c)
     for tl in (TOOLS.values() if every else [tool]):
         for d in sorted((ROOT / tl.bin).glob("*/")):
-            email = (tl.email and tl.email(d)) or "[dim]-[/]"
-            login = "[green]ok[/]" if (d / tl.cred).exists() else "[yellow]not logged in[/]"
+            ln = login_of(tl, d.name)
+            ld = LOGINS / tl.bin / ln
+            email = (tl.email and tl.email(ld)) or "[dim]-[/]"
+            login = f"[green]{ln}[/]" if (ld / tl.cred).exists() else f"[yellow]{ln} (not logged in)[/]"
             bg = "[cyan]daemon running[/]" if daemon_alive(d) else "[dim]-[/]"
-            t.add_row(f"[dim]{tl.bin}[/]", f"[bold]{d.name}[/]", email, login, bg)
+            t.add_row(f"[dim]{tl.bin}[/]", f"[bold]{d.name}[/]", login, email, bg)
     if t.row_count:
         out.print(t)
     else:
@@ -894,16 +992,17 @@ def ls(tool, every):
 
 @cli.command()
 @click.argument("name")
-@click.option("--current", is_flag=True, help="copy this machine's current login (no re-auth needed)")
+@click.option("--current", is_flag=True, help="import this machine's current login (no re-auth needed)")
+@click.option("--login", "login", metavar="LOGIN", help="run with login LOGIN by default (default: NAME)")
 @click.pass_obj
-def new(tool, name, current):
-    """Create profile NAME."""
-    create(tool, name, current)
+def new(tool, name, current, login):
+    """Create profile NAME (a history; its login is separate)."""
+    create(tool, name, current, login)
 
 
 @cli.command()
 @click.argument("name")
-@click.confirmation_option("-y", "--yes", prompt="Delete this profile, its sessions and login?")
+@click.confirmation_option("-y", "--yes", prompt="Delete this profile and its sessions? (its login is kept)")
 @click.pass_obj
 def rm(tool, name):
     """Delete profile NAME (stops its background agents first)."""
@@ -912,7 +1011,85 @@ def rm(tool, name):
         subprocess.run(sandbox(tool, name) + [tool.bin, *tool.stop], stdin=subprocess.DEVNULL)
     stop_ssh(tool, name)
     shutil.rmtree(d)
-    ok(f"removed {tool.bin} profile [bold]{name}[/]")
+    ln = login_of(tool, name)
+    (STATE / "logins" / f"{tool.bin}-{name}").unlink(missing_ok=True)
+    if f"{tool.bin}/{name}" in read_cfg().get("logins", {}):
+        set_login(tool, name, name)
+    ok(f"removed {tool.bin} profile [bold]{name}[/]  (login [bold]{ln}[/] kept; see [cyan]login ls[/])")
+
+
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def login(ctx):
+    """Logins (accounts), separate from profiles (histories)."""
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(login_ls)
+
+
+@login.command("ls")
+@click.option("-a", "--all", "every", is_flag=True, help="all tools, not just the selected one")
+@click.pass_obj
+def login_ls(tool, every=False):
+    """List logins and the profiles using them."""
+    t = Table(box=None, padding=(0, 2), header_style="bold")
+    for c in ("Tool", "Login", "Account", "Status", "Default for"):
+        t.add_column(c)
+    for tl in (TOOLS.values() if every else [tool]):
+        for ld in sorted((LOGINS / tl.bin).glob("*/")):
+            ok_ = "[green]ok[/]" if (ld / tl.cred).exists() else "[yellow]not logged in[/]"
+            t.add_row(f"[dim]{tl.bin}[/]", f"[bold]{ld.name}[/]", (tl.email and tl.email(ld)) or "[dim]-[/]",
+                      ok_, ", ".join(login_users(tl, ld.name)) or "[dim]-[/]")
+    if t.row_count:
+        out.print(t)
+    else:
+        out.print("[dim]no logins yet - try[/] login add NAME --current")
+
+
+@login.command("add")
+@click.argument("name")
+@click.option("--current", is_flag=True, help="import this machine's current login")
+@click.pass_obj
+def login_add(tool, name, current):
+    """Create login NAME (then log in through any profile with --login NAME)."""
+    ld = LOGINS / tool.bin / name
+    if ld.exists() and not current:
+        die(f"{tool.bin} login [bold]{name}[/] already exists")
+    if current:
+        if not (tool.home / tool.cred).exists():
+            die(f"{tool.bin} is not logged in on this machine")
+        import_login(tool, name)
+        return ok(f"{tool.bin} login [bold]{name}[/] = the current login ({tool.current_email() or '?'})")
+    ld.mkdir(parents=True, mode=0o700)
+    ok(f"created {tool.bin} login [bold]{name}[/]  -  now run:  "
+       f"[cyan]{Path(sys.argv[0]).name} PROFILE --login {name} {tool.login_cmd}[/]")
+
+
+@login.command("use")
+@click.argument("profile_name", metavar="PROFILE")
+@click.argument("name", metavar="LOGIN")
+@click.pass_obj
+def login_use(tool, profile_name, name):
+    """Make LOGIN the default login of PROFILE."""
+    profile(tool, profile_name)
+    if not (LOGINS / tool.bin / name).is_dir():
+        die(f"no {tool.bin} login [bold]{name}[/]")
+    set_login(tool, profile_name, name)
+    ok(f"{tool.bin} profile [bold]{profile_name}[/] now runs as login [bold]{name}[/]")
+
+
+@login.command("rm")
+@click.argument("name")
+@click.confirmation_option("-y", "--yes", prompt="Delete this login's credentials?")
+@click.pass_obj
+def login_rm(tool, name):
+    """Delete login NAME (refused while a profile defaults to it)."""
+    ld = LOGINS / tool.bin / name
+    if not ld.is_dir():
+        die(f"no {tool.bin} login [bold]{name}[/]")
+    if users := login_users(tool, name):
+        die(f"profiles default to it: {', '.join(users)}  (point them elsewhere with [cyan]login use[/])")
+    shutil.rmtree(ld)
+    ok(f"removed {tool.bin} login [bold]{name}[/]")
 
 
 
@@ -951,7 +1128,7 @@ def coerce(key, values):
 
 def show(v):
     if isinstance(v, dict):
-        return "; ".join(f"{k}: {', '.join(x)}" for k, x in v.items()) or "[dim](none)[/]"
+        return "; ".join(f"{k}: {', '.join(x) if isinstance(x, list) else x}" for k, x in v.items()) or "[dim](none)[/]"
     if isinstance(v, list):
         return ", ".join(v) if v else "[dim](none)[/]"
     if isinstance(v, bool):
@@ -1003,6 +1180,165 @@ def config(key, values, add, drop, unset, edit):
         die(f"not found in ~/.ssh: {', '.join(missing)}")
     save_cfg(raw)
     ok(f"{key} = {show(raw.get(key, DEFAULTS[key]))}")
+
+
+# ---- usage limits: the endpoints behind claude's /usage and codex's rate-limit display ----
+def get_json(url, headers):
+    req = urllib.request.Request(url, headers={"User-Agent": f"silo/{VERSION}", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("token expired; any run refreshes it" if e.code == 401 else f"HTTP {e.code}")
+    except (OSError, ValueError) as e:
+        raise RuntimeError(str(e))
+
+
+def claude_usage(d):
+    """[(window, percent used, reset epoch)] for the login in dir D."""
+    c = json_file(d / ".credentials.json").get("claudeAiOauth", {})
+    if not (tok := c.get("accessToken")):
+        raise RuntimeError("not logged in")
+    if c.get("expiresAt", 0) / 1000 < time.time() + 60:
+        tok = claude_refresh(d, c)
+    data = get_json("https://api.anthropic.com/api/oauth/usage",
+                    {"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"})
+    if data.get("limits"):        # newer shape: one entry per limit, model-scoped ones named
+        rows = []
+        for l in data["limits"]:
+            model = ((l.get("scope") or {}).get("model") or {}).get("display_name")
+            win = {"session": "5h", "weekly": "7d"}.get(l.get("group"), l.get("group") or l.get("kind") or "?")
+            rows.append((f"{win} {model}" if model else win, float(l.get("percent") or 0),
+                         _epoch(l["resets_at"]) if l.get("resets_at") else None))
+        return rows
+    names = {"five_hour": "5h", "seven_day": "7d", "seven_day_opus": "7d Opus", "seven_day_sonnet": "7d Sonnet"}
+    return [(label, float(v["utilization"]), _epoch(v["resets_at"]) if v.get("resets_at") else None)
+            for k, label in names.items() if isinstance(v := data.get(k), dict) and v.get("utilization") is not None]
+
+
+CLAUDE_OAUTH = ("https://platform.claude.com/v1/oauth/token", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+
+
+def claude_refresh(d, c):
+    """renew an expired access token the way claude does and save it to the login (claude reloads
+    the file when it changes).  Only expired tokens: a running claude refreshes before expiry."""
+    if not c.get("refreshToken"):
+        raise RuntimeError("token expired, no refresh token; log in again")
+    body = json.dumps({"grant_type": "refresh_token", "refresh_token": c["refreshToken"],
+                       "client_id": CLAUDE_OAUTH[1], "scope": " ".join(c.get("scopes") or [])}).encode()
+    req = urllib.request.Request(CLAUDE_OAUTH[0], data=body, headers={
+        "Content-Type": "application/json", "User-Agent": f"silo/{VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            t = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"token refresh refused (HTTP {e.code}); log in again")
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"token refresh failed: {e}")
+    f = d / ".credentials.json"
+    full = json_file(f)
+    full["claudeAiOauth"] = {**c, "accessToken": t["access_token"],
+                             "refreshToken": t.get("refresh_token") or c["refreshToken"],
+                             "expiresAt": int((time.time() + t["expires_in"]) * 1000)}
+    tmp = Path(f"{f}.silo-tmp")
+    tmp.touch(mode=0o600)
+    tmp.write_text(json.dumps(full))
+    tmp.replace(f)
+    return t["access_token"]
+
+
+def codex_usage(d):
+    t = json_file(d / "auth.json").get("tokens") or {}
+    if not t.get("access_token"):
+        raise RuntimeError("not logged in")
+    h = {"Authorization": f"Bearer {t['access_token']}"}
+    if t.get("account_id"):
+        h["ChatGPT-Account-Id"] = t["account_id"]
+    data = get_json("https://chatgpt.com/backend-api/wham/usage", h)
+    rows = []
+
+    def walk(o, name):
+        if isinstance(o, dict):
+            if o.get("used_percent") is not None:
+                secs = o.get("limit_window_seconds") or 0
+                win = f"{secs // 86400}d" if secs and secs % 86400 == 0 else f"{secs // 3600}h" if secs else "?"
+                rows.append(((name + " " if name else "") + win, float(o["used_percent"]),
+                             o.get("reset_at") or (time.time() + o["reset_after_seconds"]
+                                                   if o.get("reset_after_seconds") else None)))
+                return
+            name = o.get("limit_name") or o.get("metered_feature") or name
+            for k, v in o.items():
+                walk(v, name)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v, name)
+    walk(data.get("rate_limit"), "")
+    for extra in data.get("additional_rate_limits") or []:   # per-model limits
+        walk(extra, "")
+    return rows
+
+
+def _epoch(iso):
+    from datetime import datetime
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def _until(ts):
+    if not ts:
+        return "[dim]-[/]"
+    s = max(0, int(ts - time.time()))
+    d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
+    return f"{d}d {h}h" if d else f"{h}h {m:02d}m" if h else f"{m}m"
+
+
+def _bar(p, w=10):
+    n = round(min(p, 100) / 100 * w)
+    c = "red" if p >= 90 else "yellow" if p >= 70 else "green"
+    return f"[{c}]{'█' * n}[/][dim]{'░' * (w - n)}[/] {p:3.0f}%"
+
+
+@cli.command()
+@click.option("-a", "--all", "every", is_flag=True, help="all tools, not just the selected one")
+@click.pass_obj
+def status(tool, every):
+    """Usage limits (5h / weekly / per model) of every login."""
+    jobs = []   # (tool, login name, dir); profiles from before 0.6 still hold their own credentials
+    for tl in (TOOLS.values() if every else [tool]):
+        if not tl.usage:
+            continue
+        seen = set()
+        for ld in sorted((LOGINS / tl.bin).glob("*/")):
+            jobs.append((tl, ld.name, ld))
+            seen.add(ld.name)
+        for d in sorted((ROOT / tl.bin).glob("*/")):
+            cred = d / tl.cred
+            if d.name not in seen and cred.exists() and not cred.is_symlink():
+                jobs.append((tl, d.name, d))
+    if not jobs:
+        return out.print("[dim]no logins yet - try[/] login add NAME --current")
+    res = [None] * len(jobs)
+
+    def fetch(i, tl, d):
+        try:
+            res[i] = tl.usage(d)
+        except RuntimeError as e:
+            res[i] = str(e)
+    th = [threading.Thread(target=fetch, args=(i, j[0], j[2])) for i, j in enumerate(jobs)]
+    with out.status("asking for usage ..."):
+        for t in th:
+            t.start()
+        for t in th:
+            t.join()
+    t = Table(box=None, padding=(0, 2), header_style="bold")
+    for c in ("Tool", "Login", "Account", "Window", "Used", "Resets in"):
+        t.add_column(c)
+    for (tl, name, d), r in zip(jobs, res):
+        head = [f"[dim]{tl.bin}[/]", f"[bold]{name}[/]", (tl.email and tl.email(d)) or "[dim]-[/]"]
+        if isinstance(r, str) or not r:
+            t.add_row(*head, "", f"[yellow]{r or 'no limits reported'}[/]", "")
+        for i, (win, p, reset) in enumerate(r if isinstance(r, list) else []):
+            t.add_row(*(head if i == 0 else ["", "", ""]), win, _bar(p), _until(reset))
+    out.print(t)
 
 
 @cli.command("check-update")

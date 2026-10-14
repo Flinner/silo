@@ -2,10 +2,10 @@
 
 ![silo — every AI coding agent in its own sandbox, under its own account](assets/banner.png)
 
-**One Python file. Many accounts. Every agent CLI in its own bubblewrap sandbox.**
+**One Python file. Accounts and histories mixed freely. Every agent CLI in its own bubblewrap sandbox.**
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.5.0-blue)](https://github.com/flinner/silo/blob/main/silo)
+[![Version](https://img.shields.io/badge/version-0.6.0-blue)](https://github.com/flinner/silo/blob/main/silo)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Sandbox](https://img.shields.io/badge/sandbox-bubblewrap-orange)](https://github.com/containers/bubblewrap)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey)](#limitations)
@@ -25,20 +25,24 @@
 
 ```console
 $ silo ls -a
-  Tool      Profile    Account                Login            Background
-  claude    main       me@university.edu      ok               daemon running
-  claude    work       me@company.com         ok               -
-  codex     main       me@example.org         ok               -
-  codex     scratch    -                      not logged in    -
+  Tool      Profile    Login                      Account              Background
+  claude    main       main                       me@university.edu    daemon running
+  claude    work       work                       me@company.com       -
+  claude    research   main                       me@university.edu    -
+  codex     main       main                       me@example.org       -
+  codex     scratch    scratch (not logged in)    -                    -
 
-$ silo work                 # claude, logged in as work, sandboxed
-$ silo main --bg 'fix CI'   # a background agent on the other account, at the same time
-$ silo-codex main           # codex, same sandbox rules
+$ silo work                     # claude, logged in as work, sandboxed
+$ silo main --bg 'fix CI'       # a background agent on the other account, at the same time
+$ silo work --login main -c     # continue work's conversation on the main account
+$ silo-codex main               # codex, same sandbox rules
 ```
 
-**A profile is a directory.** Each one is a separate `CLAUDE_CONFIG_DIR` /
-`CODEX_HOME`, so accounts never overwrite each other's logins and any number
-run side by side. Every run is wrapped in [bubblewrap](https://github.com/containers/bubblewrap):
+**A profile is a history; a login is an account.** Each profile is a separate
+`CLAUDE_CONFIG_DIR` / `CODEX_HOME` holding its sessions, so any number run
+side by side. Logins are stored apart from profiles and picked independently:
+several profiles can share one login, and one profile's history can be
+continued under any login (handy when an account hits its limit). Every run is wrapped in [bubblewrap](https://github.com/containers/bubblewrap):
 
 - your home is **empty** — only the working directory, the profile and paths
   you choose exist, plus your tools and git identity read-only;
@@ -55,7 +59,7 @@ with no root, no containers and no system service:
 | | |
 |---|---|
 | **No sudo, ever** | Unprivileged user namespaces via `bwrap`. Nothing to install system-wide beyond the packages below. |
-| **Accounts side by side** | One config dir per profile. `silo work` and `silo main` run concurrently; claude sessions in different profiles can still list and message each other. |
+| **Accounts side by side** | One config dir per profile, any login per run. `silo work` and `silo main` run concurrently; claude sessions in different profiles can still list and message each other. |
 | **Empty home** | The sandbox starts from an empty home. You map back what the agent needs; everything else, from browser profiles to `~/.aws`, simply isn't there. |
 | **Brokered keys** | `ssh`/`scp`/`git push` to hosts you allow, `gpg` signing through your agent, allowlisted `gh` subcommands with your token — none of the secrets enter the sandbox. |
 | **Polite by default** | Runs at `nice 10` and idle IO priority; an optional memory cap (a systemd user scope) covers the agent and everything it spawns. |
@@ -100,13 +104,31 @@ Normal commands check at most once a day — configurable with
 ```bash
 silo init                     # onboarding: logins, filesystem, brokers, limits, updates
 silo ls -a                    # see the profiles
-silo new work                 # a fresh profile ...
-silo work auth login          # ... and log it in (codex: silo-codex work login)
+silo new work                 # a fresh profile, with its own login 'work' ...
+silo work auth login          # ... logged in (codex: silo-codex work login)
 silo work                     # run claude as 'work'
+silo new research --login main      # another history on an existing login
+silo work --login main              # this run only: work's history, main's account
+silo login use work main            # from now on
+silo status -a                      # 5h / weekly / per-model limits of every login
 ```
 
+```console
+$ silo status -a
+  Tool      Login    Account               Window      Used               Resets in
+  claude    main     me@university.edu     5h          ███░░░░░░░  27%    2h 39m
+                                           7d          █████████░  91%    5d 19h
+                                           7d Opus     ██████████ 100%    5d 19h
+  codex     main     me@example.org        5h          ░░░░░░░░░░   0%    4h 59m
+                                           7d          █░░░░░░░░░  12%    5d 23h
+```
+
+`status` asks the same endpoints claude's `/usage` and codex's limit display
+use. It never refreshes a token (that would race the tool's own refresh); an
+expired one says so, and the next run of any profile with that login renews it.
+
 `silo init` walks through six steps: **logins** (if claude or codex is logged
-in, import it as a profile), **filesystem** (extra writable and read-only paths,
+in, import it as a login, with a profile of the same name if none exists), **filesystem** (extra writable and read-only paths,
 your PATH tools, git config), **brokered access** (ssh key and allowed hosts,
 gpg, gh), **hidden paths**, **resources** (nice, IO priority, memory) and
 **updates** (whether to check automatically). Tab completes paths, keys and
@@ -122,10 +144,15 @@ directory is mounted read-write. Run it from a project directory.
 |---|---|
 | `init` | Interactive onboarding; writes `~/.config/silo/config.json` |
 | `config [KEY [VALUE...]]` | Show all settings, read one, or set one (`--add` / `--drop` for lists, `--unset`, `--edit`) |
-| `ls [-a]` | Profiles of the selected tool (`-a`: all tools) with account, login and background-daemon state |
-| `new NAME [--current]` | Create a profile; `--current` copies this machine's current login |
-| `rm NAME [-y]` | Delete a profile, stopping its background agents and ssh broker first |
-| `NAME [ARGS...]` | Run the tool as `NAME`; every flag passes through (`silo work -c`, `silo work --bg '...'`) |
+| `ls [-a]` | Profiles of the selected tool (`-a`: all tools) with login, account and background-daemon state |
+| `new NAME [--login L] [--current]` | Create a profile using login `L` (default: `NAME`); `--current` imports this machine's current login as it |
+| `rm NAME [-y]` | Delete a profile, stopping its background agents and ssh broker first; its login is kept |
+| `login [ls [-a]]` | Logins, their accounts and the profiles that default to them |
+| `login add NAME [--current]` | Create an empty login (log in with `silo PROFILE --login NAME auth login`), or import the current one |
+| `login use PROFILE LOGIN` | Make `LOGIN` the default login of `PROFILE` |
+| `status [-a]` | Usage limits of every login: 5-hour, weekly and per-model windows, how much is used and when each resets |
+| `login rm NAME [-y]` | Delete a login (refused while a profile defaults to it) |
+| `NAME [--login L] [ARGS...]` | Run the tool as profile `NAME` (with login `L` for this run); every other flag passes through (`silo work -c`, `silo work --bg '...'`) |
 | `NAME --shell` | A shell inside `NAME`'s sandbox, to see exactly what the agent sees |
 | `check-update` / `update` | Check for / install a newer silo |
 | `-t, --tool claude\|codex` | Choose the tool (default: claude; `silo-codex` defaults to codex) |
@@ -146,8 +173,8 @@ $ silo config --edit              # or open the JSON in $EDITOR
 
 ```json
 {
-  "config_version": "1.1",
-  "silo_min_version": "0.5.0",
+  "config_version": "1.2",
+  "silo_min_version": "0.6.0",
   "writable": ["~/code/tmp"],
   "readable": ["~/datasets"],
   "path_dirs": true,
@@ -162,7 +189,8 @@ $ silo config --edit              # or open the JSON in $EDITOR
   "ionice": "idle",
   "memory_max": "8G",
   "swap_max": "0",
-  "check_updates": "ask"
+  "check_updates": "ask",
+  "logins": {"claude/research": "main"}
 }
 ```
 
@@ -182,6 +210,7 @@ $ silo config --edit              # or open the JSON in $EDITOR
 | `ionice` | `idle` | IO priority: `idle` \| `low` \| `normal` |
 | `memory_max` | `""` | Memory cap, e.g. `8G` or `50%`; needs a systemd user session, skipped with a warning otherwise |
 | `swap_max` | `""` | Swap cap alongside `memory_max`, e.g. `0` |
+| `logins` | `{}` | `"tool/profile": login` for profiles not using the login of their own name (`silo login use`) |
 | `check_updates` | `ask` | `ask` \| `always` \| `never` |
 
 Environment overrides: `SILO_ROOT` (default `~/.config/silo`), `SILO_SSH_KEYS` (space- or comma-separated).
@@ -252,9 +281,24 @@ Git over **https** has no broker: use ssh remotes (brokered above) or `gh`.
 ```
 
 **Profiles.** `~/.config/silo/<tool>/<name>/` is the tool's whole config
-directory. A new profile copies your settings (`settings.json`,
+directory, minus the login. A new profile copies your settings (`settings.json`,
 `config.toml`) and symlinks shared instructions (`CLAUDE.md`, `AGENTS.md`,
 skills), so edits to those apply everywhere.
+
+**Logins.** `~/.config/silo/logins/<tool>/<name>/` holds one account: the
+credential file (`.credentials.json`, `auth.json`) and, for claude, the
+`oauthAccount` record from `.claude.json`. A profile defaults to the login of
+its own name; `silo login use` changes that (stored as `logins` in
+`config.json`) and `--login` overrides it for one run. The login is chosen
+**per sandbox**: silo binds only that login's directory into the run and points
+the tool at it — claude through `CLAUDE_SECURESTORAGE_CONFIG_DIR`, which
+relocates just its credentials (claude refuses symlinked credentials and
+replaces the file by rename, so neither a link nor a file bind would do); codex
+through a symlink from the profile's `auth.json`. So one profile can run under
+several logins at once, and the other logins stay hidden. silo also writes the
+login's account record into the profile's `.claude.json`, saving the previous
+one back to its login. Profiles from silo < 0.6 migrate the same way on
+their first run: their credentials become the login of the same name.
 
 **Mount layout.** `/` is bound read-only; `/tmp` is the profile's own
 persistent directory; `$XDG_RUNTIME_DIR` is replaced by an empty tmpfs (it
@@ -308,6 +352,11 @@ its login files, and how to read the account email.
 ## Limitations
 
 - Linux only (bubblewrap); unprivileged user namespaces must be enabled.
+- One claude profile can run under several logins at once, but its
+  `.claude.json` holds a single account record (email, organization), which
+  follows the latest launch; credentials are unaffected. Codex profiles share
+  one `auth.json` link, so concurrent codex runs of a profile use the latest
+  launch's login.
 - The network namespace is shared (agents need the network), so abstract
   unix sockets such as X11's remain reachable.
 - Window resizes are not forwarded to brokered interactive ssh sessions.

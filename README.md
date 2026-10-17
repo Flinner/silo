@@ -332,6 +332,19 @@ writable paths. The token in `~/.config/gh` is hidden from the sandbox.
 
 Git over **https** has no broker: use ssh remotes (brokered above) or `gh`.
 
+### notify-email
+
+To run the notification helper with the host's mail configuration, add
+`"notify-email": ["*"]` to `brokered` in settings, keeping existing entries.
+`*` allows all arguments for a command without subcommands. Restart the silo
+session to mount its shim. Mail credentials stay on the host; stdin, exit status,
+and Claude/Codex session IDs pass through the broker for message threading.
+
+Attachments must be regular files inside the sandbox's writable paths, including
+when reached through symlinks. Use full option names (`--attach`, not `--att`).
+Copy sandbox-only `/tmp` attachments into the project before sending.
+Use `notify-email --dry-run "Subject" "Body"` to check without sending mail.
+
 ## How it works
 
 ```

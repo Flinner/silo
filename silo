@@ -3,7 +3,7 @@
 
 https://github.com/flinner/silo  -  MIT License
 """
-import copy, curses, tempfile, sqlite3, contextlib, math
+import argparse, copy, curses, tempfile, sqlite3, contextlib, math
 import base64, fnmatch, urllib.request, urllib.error, json, os, re, select, shutil, signal, socket, subprocess, sys, threading, time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -16,14 +16,16 @@ try:
     from rich.panel import Panel
     from rich.text import Text
 except ImportError as e:
-    sys.exit(f"silo: missing Python package '{e.name}'. Install bubblewrap, click, rich and prompt_toolkit:\n"
-             "  Arch:          sudo pacman -S bubblewrap python-click python-rich python-prompt_toolkit\n"
-             "  Debian/Ubuntu: sudo apt install bubblewrap python3-click python3-rich python3-prompt-toolkit\n"
-             "  Fedora:        sudo dnf install bubblewrap python3-click python3-rich python3-prompt-toolkit")
+    sys.exit(f"silo: missing Python package '{e.name}'. Install bubblewrap, click and rich:\n"
+             "  Arch:          sudo pacman -S bubblewrap python-click python-rich\n"
+             "  Debian/Ubuntu: sudo apt install bubblewrap python3-click python3-rich\n"
+             "  Fedora:        sudo dnf install bubblewrap python3-click python3-rich")
 if not shutil.which("bwrap"):
     sys.exit("silo: bubblewrap (bwrap) is not installed; see https://github.com/flinner/silo#install")
 
 VERSION = "0.9.0"
+NEWS_URL = "https://raw.githubusercontent.com/flinner/silo/main/NEWS.json"   # release notes, fetched like updates
+BUILD = f"{VERSION}:{int(os.path.getmtime(os.path.realpath(__file__)))}"   # brokers restart when this changes
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/silo/main/silo"
 
 HOME = Path.home()
@@ -233,7 +235,7 @@ class Harness:
     def daemon_alive(self, run_dir):
         return False
 
-    background = ()               # argv[1] of the tool's own helper processes: (daemon, others to ignore)
+    background = ()               # argv[1] of the tool's own background processes (daemon and its helpers)
 
     def env_login(self, env):
         """the login a running process uses, from its environment."""
@@ -245,16 +247,15 @@ class Harness:
         for d in Path("/proc").iterdir():
             try:
                 argv = (d / "cmdline").read_bytes().split(b"\0")
+                argv = argv[0].split(b" ") + argv[1:]   # helpers retitle argv[0] as "claude bg-spare"
                 if not d.name.isdigit() or Path(argv[0].decode()).name != self.bin:
                     continue
                 env = dict(v.split("=", 1) for v in (d / "environ").read_bytes().decode(errors="replace").split("\0") if "=" in v)
             except (OSError, IndexError):
                 continue
             arg = argv[1].decode(errors="replace") if len(argv) > 1 else ""
-            if self.background and arg in self.background[1:]:
-                continue
             if profile := env.get(self.config_env):
-                kind = "daemon" if self.background and arg == self.background[0] else "session"
+                kind = "daemon" if arg in self.background else "session"
                 found.append((int(d.name), profile, self.env_login(env), kind))
         return found
 
@@ -327,7 +328,7 @@ class Claude(Harness):
     def daemon_alive(self, run_dir):
         return any(alive(s) for s in (run_dir / "tmp").glob("cc-daemon-*/*/control.sock"))
 
-    background = ("daemon", "bg-spare")
+    background = ("daemon", "bg-spare", "bg-pty-host")   # helpers outlive a dead daemon
 
     def env_login(self, env):
         return Path(env[self.cred_env]).name if self.cred_env in env else None
@@ -483,7 +484,7 @@ ALIASES = {"silo": "claude", "silo-codex": "codex"}  # argv[0] -> default tool
 # config.json carries its schema version and the oldest silo that understands it.
 # Bump CONFIG_VERSION minor for added keys (older silo warns, keeps going), major for
 # incompatible changes (older silo refuses); CONFIG_MIN_SILO is the release that introduced it.
-CONFIG_VERSION = "1.4"
+CONFIG_VERSION = "1.6"
 CONFIG_MIN_SILO = "0.8.0"
 
 
@@ -493,6 +494,7 @@ class Setting:
     description: str
     choices: tuple = ()
     scope: str = "profile"        # profile: may be overridden per profile; global: config-wide only
+    since: str = "0.9.0"          # the silo release that added it: newer than `seen_version` shows as new
 
 
 def _tool_profile(key):
@@ -502,7 +504,7 @@ def _tool_profile(key):
 
 
 SETTINGS = {
-    "ssh_keys": Setting([], "SSH key names supplied by you; files are never inspected by this editor"),
+    "ssh_keys": Setting([], "SSH keys the broker loads, by name in ~/.ssh (the key files never enter the sandbox)"),
     "ssh_config": Setting(False, "Let the SSH broker use your host aliases and connection settings"),
     "ssh_hosts": Setting([], "Allowed SSH destinations (globs accepted; empty allows any host)"),
     "writable": Setting([], "Additional paths the agent may change"),
@@ -517,7 +519,8 @@ SETTINGS = {
     "git_config": Setting(True, "Expose your Git identity and configuration as read-only"),
     "gpg": Setting(False, "Enable signing and decryption through the host GPG agent"),
     "onboarding_complete": Setting(False, "First-run setup has been completed", scope="global"),
-    "profile_settings": Setting({}, "Sandbox and resource settings saved independently for each history profile",
+    "seen_version": Setting("", "Newest silo release whose news and new settings you have seen", scope="global"),
+    "profile_settings": Setting({}, "Sandbox and resource settings of each profile (by name; every tool in it shares them)",
                                 scope="global"),
     "default_tool": Setting("claude", "Agent of the saved default account", tuple(HARNESSES), "global"),
     "default_profiles": Setting({}, "Default history for each tool (tool: profile; otherwise main)", scope="global"),
@@ -533,6 +536,50 @@ SETTINGS = {
                       "Paths to hide even when their parent is exposed"),
 }
 DEFAULTS = {key: copy.deepcopy(s.default) for key, s in SETTINGS.items()}
+
+
+# (version, step): each step rewrites a file older than its version into that version's shape.
+# A rename or reshape adds a step here and bumps CONFIG_VERSION; added keys need no step.
+def _settings_by_name(raw):              # 1.6: a profile is a name shared by every tool
+    merged = {}
+    for key, overrides in (raw.get("profile_settings") or {}).items():
+        merged.setdefault(key.split("/", 1)[-1], {}).update(overrides if isinstance(overrides, dict) else {})
+    if merged:
+        raw["profile_settings"] = merged
+
+
+MIGRATIONS = (("1.6", _settings_by_name),)
+
+
+def valid_news(data):
+    """NEWS.json entries that have the expected shape, newest first."""
+    ok = [n for n in data if isinstance(n, dict) and isinstance(n.get("version"), str) and _vtuple(n["version"])
+          and isinstance(n.get("date", ""), str) and isinstance(n.get("notes"), list)
+          and all(isinstance(x, str) for x in n["notes"])] if isinstance(data, list) else []
+    return sorted(ok, key=lambda n: _vtuple(n["version"]), reverse=True)
+
+
+def fetch_news():
+    """refresh the cached NEWS.json; quiet and harmless when offline."""
+    try:
+        with urllib.request.urlopen(NEWS_URL, timeout=5) as r:
+            news = valid_news(json.loads(r.read()))
+        STATE.mkdir(parents=True, exist_ok=True)
+        write_json(STATE / "news.json", news, mode=0o644)
+        return news
+    except (OSError, ValueError):
+        return cached_news()
+
+
+def cached_news():
+    return valid_news(json_file(STATE / "news.json") or [])
+
+
+def unseen(raw):
+    """(news entries, setting names) newer than the release the user has seen."""
+    seen = _vtuple(raw.get("seen_version") or "0.9.0")    # configs from before news existed saw 0.9.0
+    news = [n for n in cached_news() if seen < _vtuple(n["version"]) <= _vtuple(VERSION)]
+    return news, [k for k, s in SETTINGS.items() if _vtuple(s.since) > seen]
 CHOICES = {key: list(s.choices) for key, s in SETTINGS.items() if s.choices}
 
 
@@ -554,7 +601,7 @@ class Config:
             raise ValueError(f"{key}: use a size like 4G, a percentage, infinity, or blank")
         if key == "profile_settings":
             for name, overrides in value.items():
-                _tool_profile(name)
+                validate_name(name)
                 Config.check_profile(overrides)
         if key in ("default_profiles", "default_logins"):
             for tool, name in value.items():
@@ -641,10 +688,16 @@ class Config:
             raise ValueError(f"{CONFIG} is config v{have}; this silo reads v{CONFIG_VERSION}. Run silo update")
         if _vtuple(have) > _vtuple(CONFIG_VERSION):
             err.print(f"[yellow]![/] config v{have} is newer than this silo (v{CONFIG_VERSION}); unknown keys are ignored")
-        if "ssh_key" in raw:                                   # config 1.0: a single key
-            old = raw.pop("ssh_key")
-            raw.setdefault("ssh_keys", [old] if old else [])
-        return Config.validate(raw)
+        steps = [step for version, step in MIGRATIONS if _vtuple(have) < _vtuple(version)]
+        for step in steps:
+            step(raw)
+        Config.validate(raw)
+        if steps:                                              # persist the new shape once
+            try:
+                Config.save(raw)
+            except OSError as e:
+                err.print(f"[yellow]![/] could not save the migrated {CONFIG}: {e}")
+        return raw
 
     @staticmethod
     def save(raw):
@@ -675,7 +728,7 @@ class Config:
     def effective(raw, h=None, name=None):
         cfg = {key: copy.deepcopy(raw.get(key, s.default)) for key, s in SETTINGS.items()}
         if h is not None and name is not None:
-            cfg.update(copy.deepcopy(raw.get("profile_settings", {}).get(f"{h.name}/{name}", {})))
+            cfg.update(copy.deepcopy(raw.get("profile_settings", {}).get(name, {})))
         return cfg
 
     @staticmethod
@@ -705,9 +758,9 @@ class Config:
 
     @staticmethod
     def commit_profile(h, name, base, draft):
-        Profile(h, name).require()
+        validate_name(name)
         Config.check_profile(draft)
-        key = f"{h.name}/{name}"
+        key = name
 
         def apply(raw):
             profiles = copy.deepcopy(raw.get("profile_settings", {}))
@@ -717,6 +770,10 @@ class Config:
             profiles[key] = current
             raw["profile_settings"] = {k: v for k, v in profiles.items() if v}
         Config.update(apply)
+
+    @staticmethod
+    def mark_seen():
+        Config.update(lambda raw: raw.update(seen_version=VERSION))
 
     @staticmethod
     def defaults(h):
@@ -785,6 +842,22 @@ class Profile:
             raise ValueError(f"no {self.h.name} profile {self.name} (create it with new)")
         return self
 
+    def ensure(self):
+        """a profile is a name: the first launch of a tool in it creates that tool's part."""
+        if not self.exists():
+            self.path.mkdir(parents=True, mode=0o700)
+            self.h.seed_profile(self.path)
+        return self
+
+    @staticmethod
+    def names():
+        """every profile name, whichever tools have it so far."""
+        return sorted({p.name for h in HARNESSES.values() for p in Profile.all(h)})
+
+    def siblings(self):
+        """the same profile in the other tools that have it."""
+        return [Profile(h, self.name) for h in HARNESSES.values() if h is not self.h and Profile(h, self.name).exists()]
+
     @property
     def login(self):
         """the login this profile runs with: its own choice (`login use`), else the tool's default."""
@@ -849,6 +922,8 @@ try:
 except OSError as e:
     sys.exit(f"{cmd} (sandbox): broker unavailable: {{e}}")
 req = {{"cmd": {cmd!r}, "argv": sys.argv[1:], "term": os.environ.get("TERM", ""), "cwd": os.getcwd()}}
+if {cmd!r} == "notify-email":
+    req["env"] = {{k: os.environ[k] for k in ("CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID") if k in os.environ}}
 socket.send_fds(s, [json.dumps(req).encode()], [0, 1, 2])
 data = b""
 while chunk := s.recv(4096):
@@ -895,7 +970,7 @@ def ssh_vet(argv, cfg):
     host = re.sub(r":\d+$", "", host).strip("[]")
     allowed = cfg["ssh_hosts"]
     if allowed and not any(fnmatch.fnmatch(host, pat) for pat in allowed):
-        return f"host '{host}' is not in the allowed list ({', '.join(allowed)}); see `init`"
+        return f"host '{host}' is not in the allowed list ({', '.join(allowed)}); see silo → s settings"
     return None
 
 
@@ -907,12 +982,42 @@ def cmd_vet(cmd, argv, cwd, cfg, rt):
     roots = [Path(r) for r in json_file(rt / "roots.json") or []]
     if not under(Path(cwd).resolve(), roots):
         return f"working directory {cwd} is outside the sandbox's writable paths"
+    if cmd == "notify-email":
+        why = notify_vet(argv, cwd, roots)
+        if why:
+            return why
     if argv in ([], ["--help"], ["--version"]):
         return None
     words = [a for a in argv if not a.startswith("-")][:3]
-    if any(words[:len(a.split())] == a.split() for a in allow):
+    if "*" in allow or any(words[:len(a.split())] == a.split() for a in allow):
         return None
     return f"'{cmd} {' '.join(words)}' is not in the allowlist ({', '.join(allow)})"
+
+
+def notify_vet(argv, cwd, roots):
+    """Parse exact options so argparse abbreviations cannot bypass attachment checks."""
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
+    for flag in ("--auto", "--markdown", "--md", "--plain", "--text", "--dry-run",
+                 "--new", "--list", "--why", "--help", "-h"):
+        parser.add_argument(flag, action="store_true")
+    parser.add_argument("--attach", action="append", default=[])
+    parser.add_argument("--thread")
+    parser.add_argument("subject", nargs="?")
+    parser.add_argument("body", nargs="?")
+    try:
+        args, unknown = parser.parse_known_args(argv)
+    except argparse.ArgumentError as e:
+        return str(e)
+    if unknown:
+        return "unknown notify-email arguments; use full option names"
+    for raw in args.attach:
+        path = Path(raw).expanduser()
+        path = (Path(cwd) / path).resolve()
+        if not under(path, roots):
+            return "attachments must be inside the sandbox's writable paths"
+        if not path.is_file():
+            return "attachment not found or not a regular file"
+    return None
 
 
 def attached(p, conn):
@@ -952,9 +1057,13 @@ class Broker:
         env = {**os.environ, "SSH_AUTH_SOCK": str(agent)}
         for k in keys:
             if k not in loaded:
-                subprocess.run(["ssh-add", "-q", HOME / ".ssh" / k], env=env, check=True)
+                if subprocess.run(["ssh-add", "-q", HOME / ".ssh" / k], env=env).returncode:
+                    raise ValueError(f"ssh key {k} could not be loaded into the broker's agent (ssh-add failed); "
+                                     "fix it or drop it from ssh_keys in settings")
                 loaded.append(k)
         state.write_text(json.dumps(loaded))
+        if alive(self.sock) and self.build() != BUILD:     # left over from another silo: replace it in place
+            self.stop()
         if not alive(self.sock):
             self.sock.unlink(missing_ok=True)
             p = self.run.profile
@@ -970,6 +1079,25 @@ class Broker:
                 raise ValueError(f"broker did not start; see {self.rt / 'broker.log'}")
         return self.sock
 
+    def build(self):
+        try:
+            return (self.rt / "broker.build").read_text()
+        except OSError:
+            return None
+
+    def stop(self):
+        """end a running broker; open sessions reconnect to its replacement on the same socket."""
+        try:
+            pid = int((self.rt / "broker.pid").read_text())
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+        for _ in range(40):
+            if not alive(self.sock):
+                break
+            time.sleep(0.05)
+        self.sock.unlink(missing_ok=True)
+
     def serve(self):
         self.sock.unlink(missing_ok=True)
         srv = socket.socket(socket.AF_UNIX)
@@ -977,6 +1105,7 @@ class Broker:
         os.chmod(self.sock, 0o600)
         srv.listen()
         (self.rt / "broker.pid").write_text(str(os.getpid()))
+        (self.rt / "broker.build").write_text(BUILD)
         while True:
             conn, _ = srv.accept()
             threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
@@ -997,18 +1126,27 @@ class Broker:
             cfg = Config.load(self.run.profile.h, self.run.profile.name)
             cmd = req.get("cmd", "ssh")
             term = {"TERM": req.get("term") or "dumb"}
+            env = dict(os.environ)
+            if cmd == "notify-email":
+                for k in ("CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID"):
+                    env.pop(k, None)             # use the calling session, not the broker's parent
+                term.update({k: v for k, v in req.get("env", {}).items()
+                             if k in ("CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID") and isinstance(v, str)})
             if cmd != "ssh":
                 why = cmd_vet(cmd, req["argv"], req.get("cwd", ""), cfg, self.rt)
                 rc = 126 if why else self.spawn([shutil.which(cmd), *req["argv"]], req, fds, conn,
-                                                cwd=req["cwd"], env={**os.environ, **term})
+                                                cwd=req["cwd"], env={**env, **term})
             else:
-                why = "no ssh key configured; see `init`" if not cfg["ssh_keys"] else ssh_vet(req["argv"], cfg)
+                why = "no ssh key configured; see silo → s settings" if not cfg["ssh_keys"] else ssh_vet(req["argv"], cfg)
                 rc = 255 if why else self.ssh(req, fds, conn, cfg, term)
             if why:
                 os.write(fds[2], f"{cmd} (sandbox): {why}\n".encode())
             conn.sendall(json.dumps({"rc": rc}).encode())
-        except Exception as e:  # never take the broker down
+        except BaseException as e:  # never take the broker down, and never fail silently
             print(f"broker: {e!r}", file=sys.stderr, flush=True)
+            if len(fds) > 2:
+                with contextlib.suppress(OSError):
+                    os.write(fds[2], f"silo broker: {e}; see {self.rt / 'broker.log'}\n".encode())
         finally:
             for f in fds:
                 os.close(f)
@@ -1087,27 +1225,30 @@ def limits(cfg):
 class Sandbox:
     """bwrap argv (without the command) for one profile under one login.  Home is an empty tmpfs:
     only the cwd, the profile, its login, `writable` (rw) and `readable`, PATH dirs, git config (ro) exist."""
-    def __init__(self, profile, login, cfg=None):
+    def __init__(self, profile, login, cfg=None, extra=()):
         self.profile, self.login, self.h = profile.require(), login.require(), profile.h
         self.cfg = cfg or Config.load(self.h, profile.name)
         self.run = Run(profile, login)
+        self.tools = [(profile, login), *((p.require(), l.require()) for p, l in extra)]   # extra: (Profile, Login) of other tools
 
     def mounts(self, wd):
-        cfg, h = self.cfg, self.h
-        rw = [wd, self.run.dir, self.profile.path, *(Path(p).expanduser().resolve() for p in cfg["writable"])]
+        cfg = self.cfg
+        rw = [wd, self.run.dir, *(p.path for p, _ in self.tools), *(Path(p).expanduser().resolve() for p in cfg["writable"])]
         ro = [Path(p).expanduser() for p in cfg["readable"]]
         if cfg["path_dirs"]:
             ro += [Path(p) for p in os.environ.get("PATH", "").split(":")
                    if p and Path(p).is_dir() and HOME in Path(p).parents]
         if cfg["git_config"]:
             ro += [HOME / ".gitconfig", HOME / ".config/git"]
-        ro += [h.home / f for f in h.link]                     # shared CLAUDE.md, AGENTS.md, skills
-        exe = shutil.which(h.bin)
-        if exe and HOME in Path(exe).parents:                  # tool installed under home
-            real = Path(os.path.realpath(exe))
-            ro.append(real)
-            if not under(exe, ro):
-                ro.append((real, Path(exe)))
+        for p, _ in self.tools:
+            h = p.h
+            ro += [h.home / f for f in h.link]                 # shared CLAUDE.md, AGENTS.md, skills
+            exe = shutil.which(h.bin)
+            if exe and HOME in Path(exe).parents:              # tool installed under home
+                real = Path(os.path.realpath(exe))
+                ro.append(real)
+                if not under(exe, ro):
+                    ro.append((real, Path(exe)))
         return rw, ro
 
     def masks(self, seen):
@@ -1130,7 +1271,7 @@ class Sandbox:
         if shims:
             sock = str(Broker(self.run).ensure(cfg))
             for c, x in shims.items():
-                ro_data(b, SHIM.format(sock=sock, cmd=c).encode(), Path(x), "0755")
+                ro_data(b, SHIM.format(sock=sock, cmd=c).encode(), Path(x).resolve(), "0755")
         if cfg["gpg"] and shutil.which("gpgconf"):
             b += gpg_binds(self.run.dir)
         return b
@@ -1152,13 +1293,16 @@ class Sandbox:
                 b += ["--ro-bind", src, dst]
         for r in rw:
             b += ["--bind-try", r, r]
-        b += self.h.sandbox_args(self.profile.path)
+        for p, _ in self.tools:
+            b += p.h.sandbox_args(p.path)
         b += self.masks(rw + [r[1] if isinstance(r, tuple) else r for r in ro])
-        b += self.h.login_args(self.profile.path, self.login.path)   # after the masks: only this login is visible
+        for p, login in self.tools:
+            b += p.h.login_args(p.path, login.path)     # after the masks: only these logins are visible
         b += self.brokers(rw)
-        b += ["--setenv", self.h.config_env, self.profile.path]
-        for k, v in self.h.env.items():
-            b += ["--setenv", k, v]
+        for p, _ in self.tools:
+            b += ["--setenv", p.h.config_env, p.path]
+            for k, v in p.h.env.items():
+                b += ["--setenv", k, v]
         # keep pid + net namespaces: claude sessions check pid-namespace identity for peers
         b += ["--unshare-user", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try",
               "--die-with-parent", "--chdir", wd]
@@ -1174,16 +1318,23 @@ class ops:
         return p, Login(h, login_name) if login_name else p.login
 
     @staticmethod
-    def argv(h, profile_name=None, login_name=None, args=()):
+    def argv(h, profile_name=None, login_name=None, args=(), shell=None):
+        """the agent (or SHELL, or $SHELL for `--shell`) in the profile's sandbox, with the login's credentials."""
         p, login = ops.pick(h, profile_name, login_name)
-        sandbox = Sandbox(p, login)
-        cmd = [os.environ.get("SHELL", "/bin/sh")] if list(args) == ["--shell"] else [h.bin, *args]
+        if not p.exists() and p.name not in Profile.names():      # a typo must not become a new profile
+            raise ValueError(f"no profile {p.name} (create it with new)")
+        if list(args) == ["--shell"]:
+            shell, args = os.environ.get("SHELL", "/bin/sh"), ()
+        # a shell gets every tool of the profile, each with its own login; the agent only itself
+        extra = [(q, q.login) for q in p.siblings() if q.login.exists()] if shell else []
+        sandbox = Sandbox(p.ensure(), login, extra=extra)
+        cmd = [shell, *args] if shell else [h.bin, *args]
         return limits(sandbox.cfg) + sandbox.argv() + cmd
 
     @staticmethod
-    def run(h, profile_name=None, login_name=None, args=()):
+    def run(h, profile_name=None, login_name=None, args=(), shell=None):
         # close_fds=False: bwrap reads the shims from inherited pipe fds
-        return subprocess.run(ops.argv(h, profile_name, login_name, args), close_fds=False).returncode
+        return subprocess.run(ops.argv(h, profile_name, login_name, args, shell), close_fds=False).returncode
 
     @staticmethod
     def new(h, name, current=False, login_name=None):
@@ -1211,54 +1362,95 @@ class ops:
 
     @staticmethod
     def stop_daemons(p):
-        if not p.h.stop_daemon_cmd:
-            return
-        for run in p.runs():
-            if run.login.exists() and p.h.daemon_alive(run.dir):
-                subprocess.run(Sandbox(p, run.login).argv(wd=run.dir) + [p.h.bin, *p.h.stop_daemon_cmd],
-                               stdin=subprocess.DEVNULL, close_fds=False)
+        """ask the daemon to stop, then kill what is left of it: orphaned helpers, other versions' spares, their children."""
+        if p.h.stop_daemon_cmd:
+            for run in p.runs():
+                if run.login.exists() and p.h.daemon_alive(run.dir):
+                    subprocess.run(Sandbox(p, run.login).argv(wd=run.dir) + [p.h.bin, *p.h.stop_daemon_cmd],
+                                   stdin=subprocess.DEVNULL, close_fds=False)
+        ops.kill_tree(pid for pid, profile, _, kind in p.h.processes() if kind == "daemon" and profile == str(p.path))
+
+    @staticmethod
+    def kill_tree(pids, grace=3):
+        """SIGTERM pids and all their descendants, SIGKILL whatever is still there after grace seconds."""
+        children = {}
+        for d in Path("/proc").glob("[0-9]*"):
+            try:
+                children.setdefault(int((d / "stat").read_text().rsplit(")", 1)[1].split()[1]), []).append(int(d.name))
+            except (OSError, IndexError, ValueError):
+                pass
+        tree, todo = set(), list(pids)
+        while todo:
+            pid = todo.pop()
+            if pid not in tree:
+                tree.add(pid)
+                todo += children.get(pid, ())
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid in tree:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, sig)
+            deadline = time.time() + grace
+            while sig == signal.SIGTERM and time.time() < deadline and any(Path(f"/proc/{pid}").exists() for pid in tree):
+                time.sleep(0.1)
+
+    @staticmethod
+    def parts(name):
+        """the profile NAME in every tool that has it."""
+        parts = [Profile(h, name) for h in HARNESSES.values() if Profile(h, name).exists()]
+        if not parts:
+            raise ValueError(f"no profile {name}")
+        return parts
 
     @staticmethod
     def rm(h, name):
-        p = Profile(h, name).require()
-        ops.stop_daemons(p)
-        for run in p.runs():
-            run.stop_brokers()
-        login = p.login.name
-        shutil.rmtree(p.path)
-        shutil.rmtree(RUNS / h.name / name, ignore_errors=True)
+        """delete profile NAME in every tool (stopping daemons first); logins are kept."""
+        parts = ops.parts(name)
+        for p in parts:
+            ops.stop_daemons(p)
+            for run in p.runs():
+                run.stop_brokers()
+            shutil.rmtree(p.path)
+            shutil.rmtree(RUNS / p.h.name / name, ignore_errors=True)
 
         def apply(raw):
-            for key in ("logins", "profile_settings"):
-                raw[key] = {k: v for k, v in raw.get(key, {}).items() if k != p.key}
+            raw["logins"] = {k: v for k, v in raw.get("logins", {}).items() if k not in {p.key for p in parts}}
+            raw["profile_settings"] = {k: v for k, v in raw.get("profile_settings", {}).items() if k != name}
         Config.update(apply)
-        return f"removed {h.name} profile [bold]{name}[/]  (login [bold]{login}[/] kept; see [cyan]login ls[/])"
+        return f"removed profile [bold]{name}[/] ({', '.join(p.h.name for p in parts)}; logins kept, see [cyan]login ls[/])"
 
     @staticmethod
     def rename(h, name, new_name):
-        p, target = Profile(h, name).require(), Profile(h, new_name)
-        if target.exists():
+        """rename profile NAME in every tool, with its settings and defaults."""
+        parts = ops.parts(name)
+        validate_name(new_name)
+        if Profile.names().count(new_name):
             raise ValueError(f"profile {new_name} already exists")
-        if p.daemon_logins():
+        if any(p.daemon_logins() for p in parts):
             raise ValueError("Stop this profile's background daemon before renaming it")
-        for run in p.runs():
-            run.stop_brokers()
-        p.path.rename(target.path)
+        done = []
         try:
+            for p in parts:
+                for run in p.runs():
+                    run.stop_brokers()
+                p.path.rename(Profile(p.h, new_name).path)
+                done.append(p)
+
             def apply(raw):
-                for key in ("logins", "profile_settings"):
-                    m = dict(raw.get(key, {}))
-                    if p.key in m:
-                        m[target.key] = m.pop(p.key)
-                    raw[key] = m
-                if raw.get("default_profiles", {}).get(h.name) == name:
-                    raw["default_profiles"] = {**raw["default_profiles"], h.name: new_name}
+                raw["logins"] = {(f"{k.split('/')[0]}/{new_name}" if k.split("/")[-1] == name else k): v
+                                 for k, v in raw.get("logins", {}).items()}
+                settings = dict(raw.get("profile_settings", {}))
+                if name in settings:
+                    settings[new_name] = settings.pop(name)
+                raw["profile_settings"] = settings
+                raw["default_profiles"] = {t: new_name if v == name else v for t, v in raw.get("default_profiles", {}).items()}
             Config.update(apply)
         except BaseException:
-            target.path.rename(p.path)
+            for p in done:
+                Profile(p.h, new_name).path.rename(p.path)
             raise
-        shutil.rmtree(RUNS / h.name / name, ignore_errors=True)
-        return f"renamed {h.name} profile {name} to {new_name}"
+        for p in parts:
+            shutil.rmtree(RUNS / p.h.name / name, ignore_errors=True)
+        return f"renamed profile {name} to {new_name}"
 
     @staticmethod
     def login_add(h, name, current=False):
@@ -1334,6 +1526,205 @@ class ops:
     @staticmethod
     def usage(h, name, force=False):
         return fetch_usage(h, name, force)
+
+
+# ---- sessions: every interactive launch can be detached (ctrl-]) and attached again ------------
+# A small holder process owns the session's terminal (a pty) and outlives the launcher and
+# your terminal; `attach` connects a terminal to it.  State lives in $XDG_RUNTIME_DIR, which
+# the sandbox never sees, so an agent cannot attach to another session.
+SESSIONS = RUNTIME / "silo" / "sessions"
+DETACH = b"\x1d"          # ctrl-]
+
+
+class Session:
+    def __init__(self, id):
+        self.id = str(id)
+        self.dir = SESSIONS / self.id
+        self.sock = self.dir / "sock"
+
+    @property
+    def meta(self):
+        return json_file(self.dir / "meta.json")
+
+    def update(self, **fields):
+        write_json(self.dir / "meta.json", {**self.meta, **fields})
+
+    def alive(self):
+        return alive(self.sock)
+
+    def label(self):
+        m = self.meta
+        what = Path(m["shell"]).name if m.get("shell") else m.get("tool", "?")
+        n = int(m.get("attached") or 0)
+        state = f"attached ×{n}" if n > 1 else "attached" if n else "detached"
+        return f"#{self.id} {what} · {m.get('profile')} · {m.get('login')} · since {time.strftime('%H:%M', time.localtime(m.get('started', 0)))} · {state}"
+
+    @staticmethod
+    def all():
+        """running sessions, oldest first; leftovers of ended ones are cleaned up."""
+        found = []
+        for d in sorted(SESSIONS.glob("*/"), key=lambda d: int(d.name) if d.name.isdigit() else 0):
+            s = Session(d.name)
+            if s.alive():
+                found.append(s)
+            elif time.time() - s.meta.get("started", 0) > 30:     # not one that is still starting
+                shutil.rmtree(d, ignore_errors=True)
+        return found
+
+    @staticmethod
+    def start(h, profile, login, args=(), shell=None):
+        """start a held session (the holder builds the sandbox itself, so its pipes are its own)."""
+        SESSIONS.mkdir(parents=True, exist_ok=True, mode=0o700)
+        used = {d.name for d in SESSIONS.iterdir()}
+        n = next(i for i in range(1, 10000) if str(i) not in used)
+        s = Session(n)
+        s.dir.mkdir(mode=0o700)
+        write_json(s.dir / "meta.json", dict(tool=h.name, profile=profile, login=login, args=list(args), shell=shell,
+                                              cwd=os.getcwd(), started=time.time()))
+        subprocess.Popen([sys.executable, os.path.realpath(sys.argv[0]), "_hold", s.id], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=open(s.dir / "hold.log", "a"))
+        for _ in range(200):
+            if s.alive():
+                return s
+            if error := s.meta.get("error"):
+                shutil.rmtree(s.dir, ignore_errors=True)
+                raise ValueError(error)
+            time.sleep(0.05)
+        raise ValueError(f"session {s.id} did not start; see {s.dir / 'hold.log'}")
+
+    def hold(self):
+        """the holder: run the session on a pty and relay it to whoever is attached."""
+        import pty, fcntl, termios, struct
+        m = self.meta
+        try:
+            os.chdir(m["cwd"])
+            argv = ops.argv(HARNESSES[m["tool"]], m["profile"], m["login"], m["args"], m.get("shell"))
+        except Exception as e:
+            return self.update(error=str(e))
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvp(argv[0], argv)
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(str(self.sock))
+        os.chmod(self.sock, 0o600)
+        srv.listen()
+        self.update(pid=pid)
+        screen = bytearray()
+        clients = {}          # every attached terminal: socket -> [unread bytes, (rows, cols) or None]
+
+        def fit(nudge=False):
+            """the session takes the smallest attached terminal's size, so it fits in all of them."""
+            sizes = [c[1] for c in clients.values() if c[1]]
+            if not sizes:
+                return
+            rows, cols = min(r for r, _ in sizes), min(c for _, c in sizes)
+            if nudge and rows > 1:                         # a nudge makes full-screen programs redraw
+                fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows - 1, cols, 0, 0))
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+        def drop(conn):
+            clients.pop(conn, None)
+            conn.close()
+            self.update(attached=len(clients))
+            fit()
+        while True:
+            ready = select.select([fd, srv, *clients], [], [], 1.0)[0]
+            if fd in ready:
+                try:
+                    data = os.read(fd, 65536)
+                except OSError:
+                    data = b""
+                if not data:
+                    break
+                screen += data
+                del screen[:-65536]
+                for conn in list(clients):
+                    try:
+                        conn.sendall(data)
+                    except OSError:
+                        drop(conn)
+            if srv in ready:
+                conn, _ = srv.accept()
+                clients[conn] = [b"", None]
+                self.update(attached=len(clients))
+                with contextlib.suppress(OSError):
+                    conn.sendall(b"\x1b[H\x1b[2J" + bytes(screen[-16384:]))   # what was on screen, roughly
+            for conn in [c for c in ready if c in clients]:
+                try:
+                    chunk = conn.recv(65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    drop(conn)
+                    continue
+                state = clients[conn]
+                state[0] += chunk
+                while len(state[0]) >= 5 and len(state[0]) >= 5 + int.from_bytes(state[0][1:5], "big"):
+                    kind, size = state[0][:1], int.from_bytes(state[0][1:5], "big")
+                    payload, state[0] = state[0][5:5 + size], state[0][5 + size:]
+                    if kind == b"i":
+                        os.write(fd, payload)
+                    elif kind in (b"w", b"a"):
+                        state[1] = struct.unpack("HH", payload)
+                        fit(nudge=kind == b"a")
+        _, status = os.waitpid(pid, 0)
+        self.update(rc=os.waitstatus_to_exitcode(status), attached=0)
+        for conn in clients:
+            conn.close()
+        srv.close()
+        self.sock.unlink(missing_ok=True)
+
+    def attach(self):
+        """connect this terminal (others may be attached too); returns the exit code, or None after ctrl-] detaches."""
+        import tty, fcntl, termios, struct
+        conn = socket.socket(socket.AF_UNIX)
+        conn.connect(str(self.sock))
+
+        def send(kind, payload):
+            conn.sendall(kind + len(payload).to_bytes(4, "big") + payload)
+
+        def size():
+            rows, cols = struct.unpack("HHHH", fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0" * 8))[:2]
+            return struct.pack("HH", rows, cols)
+        resized = threading.Event()
+        old_tty = termios.tcgetattr(0)
+        old_winch = signal.signal(signal.SIGWINCH, lambda *_: resized.set())
+        detached = False
+        try:
+            tty.setraw(0)
+            send(b"a", size())
+            while True:
+                if resized.is_set():
+                    resized.clear()
+                    send(b"w", size())
+                ready = select.select([0, conn], [], [], 0.2)[0]
+                if 0 in ready:
+                    data = os.read(0, 4096)
+                    if DETACH in data:
+                        if before := data.split(DETACH)[0]:
+                            send(b"i", before)
+                        detached = True
+                        break
+                    send(b"i", data)
+                if conn in ready:
+                    data = conn.recv(65536)
+                    if not data:
+                        break
+                    os.write(1, data)
+        finally:
+            termios.tcsetattr(0, termios.TCSADRAIN, old_tty)
+            signal.signal(signal.SIGWINCH, old_winch)
+            conn.close()
+        if detached:
+            os.write(1, f"\r\n[silo] detached; session {self.id} keeps running · silo attach {self.id}\r\n".encode())
+            return None
+        for _ in range(40):
+            if "rc" in self.meta:
+                break
+            time.sleep(0.05)
+        rc = self.meta.get("rc", 0)
+        shutil.rmtree(self.dir, ignore_errors=True)
+        return rc
 
 
 # ---- usage snapshots: cached a minute, fetched in threads by status and the launcher ------
@@ -1551,6 +1942,7 @@ def auto_check():
         pass
     STATE.mkdir(parents=True, exist_ok=True)
     stamp.touch()
+    fetch_news()
     try:
         remote, text = fetch_remote(quiet=True)
     except BaseException:
@@ -1586,10 +1978,10 @@ registry of [cyan]~/.claude[/], so sessions (sandboxed or not, any account) can 
 [bold]Tools[/]    {tools}.  Run [bold]silo TOOL --profile NAME --login NAME[/]. Profile and login defaults are independent (main until you save another selection). Pick with [bold]-t[/], or by alias: {aliases}.
          Add one by writing a [bold]Harness[/] subclass in this script.
 [bold]Sandbox[/]  home is read-only, secrets hidden; writable only [cyan]$PWD[/], the profile dir, the session sockets and the
-         writable paths from [cyan]init[/].  [cyan]/tmp[/] is a persistent per-profile-and-login dir, so background
+         writable paths from the settings.  [cyan]/tmp[/] is a persistent per-profile-and-login dir, so background
          agents and their daemon outlive the interactive session.  [cyan]~/.ssh[/] is replaced by
          an empty dir; [bold]ssh[/] is brokered to the host with one key and an allowlist.
-[bold]Config[/]   [cyan]~/.config/silo/config.json[/] ([cyan]init[/], [cyan]config[/]); env SILO_ROOT, SILO_SSH_KEYS"""
+[bold]Config[/]   [cyan]~/.config/silo/config.json[/] ([cyan]silo[/] → s, [cyan]config[/]); env SILO_ROOT, SILO_SSH_KEYS"""
 
 EXAMPLES = """\
 [dim]$[/] silo                           [dim]# profiles, logins and settings menu[/]
@@ -1695,8 +2087,16 @@ class Cli(RichHelp, click.Group):
 def cli(ctx, tool):
     """Open the terminal menu, or run an agent directly under a sandboxed account."""
     ctx.obj = HARNESSES[tool]
-    if ctx.invoked_subcommand not in (None, "run", "update", "check-update", "_broker", "config", "tui"):
+    if ctx.invoked_subcommand not in (None, "run", "update", "check-update", "_broker", "_hold", "attach", "config", "tui"):
         ctx.call_on_close(auto_check)
+    if ctx.invoked_subcommand not in (None, "run", "_broker", "_hold", "tui", "news", "attach"):
+        try:
+            news, new = unseen(Config.read())
+        except ValueError:
+            news, new = [], []
+        if news or new:
+            err.print(f"[cyan]✦[/] what's new in silo {VERSION}"
+                      + (f": new settings {', '.join(new)}" if new else "") + " · run [cyan]silo news[/] or open [cyan]silo[/]")
     if ctx.invoked_subcommand is None:
         open_tui(tool)
 
@@ -1711,8 +2111,45 @@ def run(h, name, args):
         login, args = args[1], args[2:]
     elif args[:1] and args[0].startswith("--login="):
         login, args = args[0].split("=", 1)[1], args[1:]
+    if sys.stdin.isatty() and sys.stdout.isatty():          # interactive: a session ctrl-] can detach
+        p, chosen = call(ops.pick, h, name, login)
+        rc = Session.attach(call(Session.start, h, p.name, chosen.name, args))
+        sys.exit(rc or 0)
     argv = call(ops.argv, h, name, login, args)
     os.execvp(argv[0], argv)
+
+
+@cli.command("_hold", cls=Cmd, hidden=True)
+@click.argument("id")
+def _hold(id):
+    Session(id).hold()
+
+
+@cli.command()
+def ps():
+    """Running sessions (detach one with ctrl-], reattach with attach N)."""
+    sessions = Session.all()
+    for s in sessions:
+        out.print(s.label())
+    if not sessions:
+        out.print("[dim]no sessions running[/]")
+
+
+@cli.command()
+@click.argument("id", required=False)
+def attach(id):
+    """Attach to session ID, also while other terminals are attached (the only detached one when omitted)."""
+    sessions = Session.all()
+    if id is None:
+        free = [s for s in sessions if not s.meta.get("attached")]
+        if len(free) != 1:
+            for s in sessions:
+                out.print(s.label())
+            raise click.ClickException("several sessions; pick one: silo attach ID" if free else "no detached session")
+        id = free[0].id
+    if not Session(id).alive():
+        raise click.ClickException(f"no session {id}; see silo ps")
+    sys.exit(Session(id).attach() or 0)
 
 
 @cli.command("_broker", cls=Cmd, hidden=True)
@@ -1741,7 +2178,7 @@ def ls(h, every):
     if t.row_count:
         out.print(t)
     else:
-        out.print(f"[dim]no {'' if every else h.name + ' '}profiles yet - try[/] init")
+        out.print(f"[dim]no {'' if every else h.name + ' '}profiles yet - run[/] silo")
 
 
 @cli.command()
@@ -1877,7 +2314,7 @@ def config(h, key, values, add, drop, unset, edit, profile_name):
     global_raw = call(Config.read)
     if profile_name:
         call(Profile(h, profile_name).require)
-        raw = copy.deepcopy(global_raw.get("profile_settings", {}).get(f"{h.name}/{profile_name}", {}))
+        raw = copy.deepcopy(global_raw.get("profile_settings", {}).get(profile_name, {}))
     else:
         raw = global_raw
     base = copy.deepcopy(raw)
@@ -1893,13 +2330,15 @@ def config(h, key, values, add, drop, unset, edit, profile_name):
         persist(changed)
         return ok(f"saved {CONFIG}")
     if key is None:
+        fresh = unseen(global_raw)[1]
         t = Table(box=None, padding=(0, 2), header_style="bold")
         for c in ("Key", "Value", ""):
             t.add_column(c)
         for k, d in DEFAULTS.items():
             if profile_name and SETTINGS[k].scope != "profile":
                 continue
-            t.add_row(f"[bold green]{k}[/]", show(raw.get(k, d)), SETTINGS[k].description + (" (default)" if k not in raw else ""))
+            t.add_row(f"[bold green]{k}[/]" + (" [cyan](new)[/]" if k in fresh else ""), show(raw.get(k, d)),
+                      SETTINGS[k].description + (" (default)" if k not in raw else ""))
         out.print(t)
         return out.print(f"[dim]{CONFIG}  (config v{global_raw.get('config_version', CONFIG_VERSION)})"
                          f"  -  silo config KEY VALUE  /  --add / --drop / --unset / --edit[/]")
@@ -1968,9 +2407,25 @@ def status(h, every):
     out.print("[dim]bars: fill = used, ┃ = time gone in the window[/]")
 
 
+@cli.command()
+def news():
+    """Release notes, and the settings each release added."""
+    notes = fetch_news() if call(Config.load)["check_updates"] != "never" else cached_news()
+    if not notes:
+        out.print(f"[dim]no release notes yet (silo {VERSION})[/]")
+    for n in notes:
+        out.print(f"[bold]{n['version']}[/] [dim]{n['date']}[/]")
+        for note in n["notes"]:
+            out.print(f"  · {note}")
+        if added := [k for k, s in SETTINGS.items() if s.since == n["version"]]:
+            out.print(f"  [cyan]new settings:[/] {', '.join(added)}")
+    call(Config.mark_seen)
+
+
 @cli.command("check-update")
 def check_update():
     """Check GitHub for a newer silo (never installs)."""
+    fetch_news()
     remote, _ = fetch_remote()
     if _vtuple(remote) > _vtuple(VERSION):
         out.print(f"[yellow]↑[/] v{remote} is available (you have v{VERSION}) - run [cyan]silo update[/]")
@@ -1981,170 +2436,30 @@ def check_update():
 @cli.command()
 def update():
     """Install the latest silo from GitHub in place."""
+    fetch_news()
     remote, text = fetch_remote()
     if _vtuple(remote) <= _vtuple(VERSION):
         return ok(f"up to date (v{VERSION})")
     install_update(text, remote)
 
 
-# ---- init: question-by-question onboarding (prompt_toolkit when on a tty) ----
-def ask(label, default="", paths=False, words=()):
-    if sys.stdin.isatty():
-        from prompt_toolkit import prompt
-        from prompt_toolkit.completion import PathCompleter, WordCompleter
-        from prompt_toolkit.key_binding import KeyBindings
-        from prompt_toolkit.key_binding.bindings.completion import generate_completions
-        comp = PathCompleter(expanduser=True) if paths else WordCompleter(list(words)) if words else None
-        kb = KeyBindings()
-
-        @kb.add("tab")
-        def _(event):  # complete / cycle like readline; never insert a literal tab
-            if comp:
-                generate_completions(event)
-
-        return prompt(f"{label} ", default=default, completer=comp, key_bindings=kb,
-                      complete_while_typing=bool(words)).strip()
-    out.print(f"{label} [dim]{default}[/]", end=" ")
-    return (input() or default).strip()
-
-
-def choose(label, choices, default):
-    """ask until the answer is one of choices (Tab completes)."""
-    while (v := ask(f"{label} ({' / '.join(choices)}):", default=default, words=choices)) not in choices:
-        err.print(f"    [yellow]pick one of: {', '.join(choices)}[/]")
-    return v
-
-
-def number(label, default, lo, hi):
-    while True:
-        v = ask(label, default=str(default))
-        if v.isdigit() and lo <= int(v) <= hi:
-            return int(v)
-        err.print(f"    [yellow]a number from {lo} to {hi}[/]")
-
-
-def keep_list(current, keep_label):
-    """show the list; one question keeps it all, 'n' goes item by item."""
-    if not current:
-        return []
-    out.print("    " + ", ".join(f"[cyan]{c}[/]" for c in current))
-    if click.confirm(f"  keep {'this' if len(current) == 1 else f'these {len(current)}'}?", default=True):
-        return list(current)
-    return [c for c in current if click.confirm(f"    {keep_label} {c}?", default=True)]
-
-
-def path_list(intro, current, keep_label, add_label):
-    out.print(intro)
-    vals = keep_list(current, keep_label)
-    while p := ask(f"  {add_label}", paths=True):
-        if not Path(p).expanduser().exists():
-            out.print(f"    [yellow]note:[/] {p} does not exist (skipped while it doesn't)")
-        vals.append(p.replace(str(HOME), "~", 1) if p.startswith(str(HOME)) else p)
-    return vals
-
-
-@cli.command()
-def init():
-    """Onboarding: logins, filesystem, brokered ssh/gpg/gh, limits, updates."""
-    raw = call(Config.read)
-    cfg = {**raw, **Config.effective(raw)}   # file only, no env
-    out.print(Panel(f"Answers are saved to [cyan]{CONFIG}[/].  Re-run any time - Enter keeps the current\n"
-                    "value, Tab completes.  Change one setting later with [cyan]silo config KEY VALUE[/].",
-                    title="silo init", border_style="cyan"))
-
-    out.rule("[bold]1. Logins[/]")
-    for h in HARNESSES.values():
-        if not (h.native_login_home() / h.cred).exists():
-            out.print(f"  [dim]{h.name}: not logged in on this machine[/]")
-            continue
-        have = [login.name for login in Login.all(h)]
-        out.print(f"  [bold]{h.name}[/]: logged in as [green]{h.native_account() or '?'}[/]"
-                  + (f"   [dim](logins: {', '.join(have)})[/]" if have else ""))
-        if click.confirm(f"  import this {h.name} login?", default=not have):
-            name = ask("    login name (existing = replace it, empty = skip):",
-                       default="" if "main" in have else "main", words=have)
-            if not name:
-                out.print("    [dim]skipped[/]")
-            elif name not in have or click.confirm(
-                    f"    replace login '{name}' ({Login(h, name).account() or '?'}) with this one?", default=False):
-                ok(call(ops.login_add, h, name, current=True))
-
-    out.rule("[bold]2. Filesystem[/]")
-    out.print("  Your home is [bold]empty[/] in the sandbox (a scratch tmpfs).  The working directory and the\n"
-              "  profile are always read-write; silo refuses to run from your home itself.")
-    cfg["writable"] = path_list("  [bold]Extra read-write paths[/] (empty line ends):",
-                                cfg["writable"], "keep writable", "add writable path:")
-    cfg["readable"] = path_list("  [bold]Extra read-only paths[/] (empty line ends):",
-                                cfg["readable"], "keep readable", "add read-only path:")
-    cfg["path_dirs"] = click.confirm("  expose the PATH directories under your home (your installed tools), read-only?",
-                                     default=cfg["path_dirs"])
-    cfg["git_config"] = click.confirm("  expose ~/.gitconfig and ~/.config/git (name, email, aliases), read-only?",
-                                      default=cfg["git_config"])
-
-    out.rule("[bold]3. Brokered access[/]")
-    out.print("  These run [bold]outside[/] the sandbox on the agent's behalf; keys and tokens never enter it.")
-    out.print("  [bold]ssh[/]: enter the key names and host aliases you want to use.")
-    keys = list(dict.fromkeys(ask("  keys to load, separated by spaces (empty = no ssh):",
-                                  default=" ".join(cfg["ssh_keys"])).split()))
-    cfg["ssh_keys"] = keys
-    cfg["ssh_config"] = click.confirm("  use your SSH config for those connections?", default=cfg["ssh_config"]) if keys else False
-    if keys:
-        out.print("  allowed destinations (globs ok; none = any host):")
-        hosts = keep_list(cfg["ssh_hosts"], "keep")
-        while host := ask("  allow host:"):
-            hosts.append(host)
-        cfg["ssh_hosts"] = hosts
-    else:
-        cfg["ssh_hosts"] = []
-    cfg["gpg"] = click.confirm("  [gpg] sign/decrypt through your gpg-agent (secret keys stay in the agent)?",
-                               default=cfg["gpg"])
-    if shutil.which("gh"):
-        keep = click.confirm("  [gh] run allowlisted gh subcommands (pr, issue, run, ...) on the host?",
-                             default=bool(cfg["brokered"].get("gh")))
-        cfg["brokered"] = {**cfg["brokered"], "gh": cfg["brokered"].get("gh") or DEFAULTS["brokered"]["gh"]} \
-            if keep else {k: v for k, v in cfg["brokered"].items() if k != "gh"}
-
-    out.rule("[bold]4. Hidden paths[/]")
-    cfg["hidden"] = path_list("  Masked even inside the paths above (every login and other profile always is).\n"
-                              "  [bold]Hidden paths[/] (empty line ends):", cfg["hidden"], "keep hiding", "hide path:")
-
-    out.rule("[bold]5. Resources[/]")
-    out.print("  Applied to the sandbox and everything it starts, background agents included.")
-    cfg["nice"] = number("  CPU nice, 0 (normal) to 19 (lowest):", cfg["nice"], 0, 19)
-    cfg["ionice"] = choose("  IO priority", CHOICES["ionice"], cfg["ionice"])
-    cfg["memory_max"] = ask("  memory limit, e.g. 8G or 50% (empty = none):", default=cfg["memory_max"])
-    cfg["swap_max"] = ask("  swap limit, e.g. 0 or 2G (empty = none):", default=cfg["swap_max"]) \
-        if cfg["memory_max"] else ""
-
-    out.rule("[bold]6. Updates[/]")
-    out.print("  silo can check GitHub for a new version, at most once a day, after commands like [cyan]ls[/].\n"
-              "  [bold]ask[/] = print a hint   [bold]always[/] = install it   [bold]never[/] = stay offline")
-    cfg["check_updates"] = choose("  automatic update checks", CHOICES["check_updates"], cfg["check_updates"])
-
-    call(Config.save, cfg)
-    t = Table(box=None, show_header=False, padding=(0, 2))
-    t.add_row("writable", ", ".join(cfg["writable"]) or "[dim]cwd + profile only[/]")
-    t.add_row("readable", ", ".join(cfg["readable"] + (["PATH dirs"] if cfg["path_dirs"] else [])
-                                    + (["git config"] if cfg["git_config"] else [])) or "[dim]-[/]")
-    t.add_row("ssh", (f"{', '.join(cfg['ssh_keys'])} → " + (", ".join(cfg["ssh_hosts"]) or "[yellow]any host[/]"))
-              if cfg["ssh_keys"] else "[dim]off[/]")
-    t.add_row("gpg", "via agent" if cfg["gpg"] else "[dim]off[/]")
-    t.add_row("gh", f"{len(cfg['brokered']['gh'])} subcommands" if cfg["brokered"].get("gh") else "[dim]off[/]")
-    t.add_row("hidden", f"{len(cfg['hidden'])} paths + all logins")
-    t.add_row("resources", f"nice {cfg['nice']}, io {cfg['ionice']}, memory {cfg['memory_max'] or 'unlimited'}"
-                           + (f", swap {cfg['swap_max']}" if cfg["swap_max"] else ""))
-    t.add_row("updates", cfg["check_updates"])
-    out.print(Panel(t, title=f"saved  (config v{CONFIG_VERSION})", border_style="green"))
-    ok(f"done - try [cyan]{Path(sys.argv[0]).name} ls -a[/]")
-
-
 # ---- launcher: a curses UI over ops; standard library only --------------------------------
+def available_shells():
+    """[(name, path)]: $SHELL first, then the common ones installed here."""
+    found = {}
+    for candidate in (os.environ.get("SHELL", ""), "bash", "zsh", "fish", "sh"):
+        if candidate and (path := shutil.which(candidate)):
+            found.setdefault(Path(path).name, path)
+    return list(found.items())
+
+
 class LauncherSelection:
     """A profile (←/→) and a login (↑/↓); the selected login decides the agent."""
     def __init__(self, tool):
         self.h = HARNESSES[tool]
-        self.remembered_profiles = {}
         self.profile, self.login = Config.defaults(self.h)
+        self.shell, self.shells = None, available_shells()   # a selected shell runs in the sandbox instead of the agent
+        self.bg, self.daemons = None, []      # a selected "tool/profile" row of the background section; Enter stops it
         self.reload()
 
     def reload(self):
@@ -2157,34 +2472,40 @@ class LauncherSelection:
             else:
                 self.login = None
         self.defaults = Config.defaults(self.h)
-        self.profiles = [p.name for p in Profile.all(self.h)]
+        self.profiles = Profile.names()
         if self.profile not in self.profiles:
             self.profile = self.defaults[0] if self.defaults[0] in self.profiles else next(iter(self.profiles), None)
 
     def select_account(self, tool, name):
-        if tool != self.h.name:
-            self.remembered_profiles[self.h.name] = self.profile
-            preferred = self.remembered_profiles.get(tool, self.profile)
-            self.h = HARNESSES[tool]
-            profiles = [p.name for p in Profile.all(self.h)]
-            default = Config.defaults(self.h)[0]
-            self.profile = preferred if preferred in profiles else default if default in profiles else next(iter(profiles), None)
-        self.login = name
+        self.h, self.login = HARNESSES[tool], name      # the profile stays: names are shared by every tool
 
     def move_profile(self, direction):
         if self.profiles:
             self.profile = self.profiles[(self.profiles.index(self.profile) + direction) % len(self.profiles)]
 
     def move_login(self, direction):
-        if self.accounts:
-            index = self.accounts.index((self.h.name, self.login)) if (self.h.name, self.login) in self.accounts else 0
-            self.select_account(*self.accounts[(index + direction) % len(self.accounts)])
+        entries = self.accounts + [("shell", name) for name, _ in self.shells] + [("background", d) for d in self.daemons]
+        current = ("background", self.bg) if self.bg else ("shell", self.shell) if self.shell else (self.h.name, self.login)
+        if not entries:
+            return
+        index = entries.index(current) if current in entries else 0
+        tool, name = entries[(index + direction) % len(entries)]
+        self.bg = name if tool == "background" else None
+        if tool == "shell":
+            self.shell = name                 # keeps the agent's profile and login: the shell runs in that sandbox
+        elif tool == "background":
+            self.shell = None
+        else:
+            self.shell = None
+            self.select_account(tool, name)
             self.reload()
+
+    def shell_path(self):
+        return dict(self.shells).get(self.shell)
 
     def save_defaults(self):
         if not self.profile or not self.login:
             raise ValueError("Select an existing profile and login first")
-        Profile(self.h, self.profile).require()
         Login(self.h, self.login).require()
         Config.set_defaults(self.h, self.profile, self.login)
         self.defaults = (self.profile, self.login)
@@ -2245,6 +2566,16 @@ class Survey:
             size = self.sizes.get((h.name, name))
         return ([(pid, login) for pid, _, login, kind in procs if kind == "session"],
                 [(pid, login) for pid, _, login, kind in procs if kind == "daemon"], size)
+
+    def daemons(self):
+        """{"tool/profile": [(pid, login)]} of every profile with background processes, across tools."""
+        found = {}
+        with self.lock:
+            for tool, procs in self.procs.items():
+                for pid, path, login, kind in procs:
+                    if kind == "daemon" and Path(path).parent == ROOT / tool:
+                        found.setdefault(f"{tool}/{Path(path).name}", []).append((pid, login))
+        return dict(sorted(found.items()))
 
     def busy(self, h, name):
         return any(self.profile(h, name)[:2])
@@ -2455,62 +2786,292 @@ class TerminalUI:
             return name
         return new_name if self.attempt(ops.rename, h, name, new_name)[0] else name
 
-    def onboarding(self):
-        """First-run import/create flow, also available from the launcher with o."""
-        tools = list(HARNESSES)
+    # ---- setup wizard: import what this machine has, set the sandbox defaults, apply ----
+    SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def setup(self):
+        """first run (and o): 1 import accounts + histories, 2 sandbox defaults, 3 review and apply."""
+        items = self.setup_found()
         while True:
-            descriptions = []
-            for h in HARNESSES.values():
-                found = (["account"] if (h.native_login_home() / h.cred).is_file() else []) \
-                    + (["history"] if h.history_entries(h.native_home()) else [])
-                descriptions.append(f"{h.name.title()}: " + ("import " + " + ".join(found) if found else "create account + history"))
-            selected = self.menu("Welcome · bring your accounts and histories into silo", [*descriptions, "Finish setup"],
-                                 "Imports are copies. Sandbox settings are configured separately for each profile.")
-            if selected is None:
+            step = self.setup_import(items)
+            if step is None:
+                Config.update(lambda raw: raw.update(onboarding_complete=True, seen_version=VERSION))
+                self.message = "Setup skipped · o reopens it"
                 return
-            if selected == len(tools):
-                Config.update(lambda raw: raw.update(onboarding_complete=True))
+            self.settings(wizard=True)
+            step = self.setup_review(items)
+            if step == "back":
+                continue
+            if step is None:
                 return
-            self.h = HARNESSES[tools[selected]]
-            logins = Login.all(self.h)
-            login = logins[0].name if logins else self.new_login(self.h)
-            existing = Profile.all(self.h)
-            name = self.new_profile() if not existing or self.confirm("Create another history profile?") else existing[0].name
-            if name and login:
-                Config.set_defaults(self.h, name, login)
+            self.setup_apply([i for i in items if i["on"]])
+            return
+
+    def setup_found(self):
+        """what each harness has on this machine, sized in the background."""
+        items = []
+        for h in HARNESSES.values():
+            if (h.native_login_home() / h.cred).is_file():
+                items.append(dict(h=h, kind="account", on=True, target="main", info=h.native_account() or "account"))
+            if entries := h.history_entries(h.native_home()):
+                items.append(dict(h=h, kind="history", on=True, target="main", size=None, entries=entries,
+                                  info=", ".join(e.name for e in entries)))
+            if not any(i["h"] is h for i in items):
+                items.append(dict(h=h, kind="none", on=False, target="", info=""))
+
+        def size(item):
+            item["size"] = sum(dir_size(e) if e.is_dir() else e.stat().st_size for e in item["entries"])
+        for item in items:
+            if item["kind"] == "history":
+                threading.Thread(target=size, args=(item,), daemon=True).start()
+        return items
+
+    def setup_note(self, item):
+        """why an item may not do what it says, or ''."""
+        h, target = item["h"], item["target"]
+        if item["kind"] == "account" and Login(h, target).exists():
+            return f"login {target} exists · its credentials are replaced"
+        if item["kind"] == "history" and Profile(h, target).exists():
+            if clash := [e.name for e in item["entries"] if (Profile(h, target).path / e.name).exists()]:
+                return f"profile {target} already has {', '.join(clash)} · pick another name"
+            return f"into the existing profile {target}"
+        return ""
+
+    def setup_import(self, items):
+        selectable = [i for i, item in enumerate(items) if item["kind"] != "none"]
+        selected = 0
+        self.screen.timeout(300)       # history sizes arrive in the background
+        try:
+            while True:
+                self.frame("setup 1/3 · import")
+                height, width = self.screen.getmaxyx()
+                accent, dim, bold = self.color(1), curses.A_DIM, curses.A_BOLD
+                self.at(1, 2, "Found on this machine. Imports are copies: the originals stay untouched and keep working.", width - 4, dim)
+                y, last = 3, None
+                for i, item in enumerate(items):
+                    h = item["h"]
+                    if h is not last:
+                        y += last is not None
+                        self.at(y, 2, f"{h.name.upper():8} {h.native_home()}".replace(str(HOME), "~"), width - 4, bold | dim)
+                        y, last = y + 1, h
+                    if item["kind"] == "none":
+                        self.at(y, 4, "nothing to import · a in the launcher adds a login", width - 6, dim)
+                        y += 1
+                        continue
+                    chosen = selectable and i == selectable[selected]
+                    box = "[x]" if item["on"] else "[ ]"
+                    if item["kind"] == "account":
+                        what, arrow = f"account  {item['info']}", "login"
+                    else:
+                        what = "history  " + (human(item["size"]) if item["size"] is not None else "sizing…") + f" · {item['info']}"
+                        arrow = "profile"
+                    self.at(y, 2, ("› " if chosen else "  ") + box, 6, bold | accent if chosen else (accent if item["on"] else dim))
+                    self.at(y, 9, what, width - 40, 0 if item["on"] else dim)
+                    self.at(y, width - 30, f"→ {arrow:7} {item['target']}", 27, bold if item["on"] else dim)
+                    if note := self.setup_note(item):
+                        y += 1
+                        self.at(y, 9, note, width - 12, self.color(3) if "pick another" in note else dim)
+                    y += 1
+                self.put(height - 3, self.message, self.color(3))
+                self.at(height - 2, 2, "↑↓ select  ␣ toggle  ⏎ rename target  → next  esc skip setup", width - 4, dim)
+                self.screen.refresh()
+                try:
+                    key = self.screen.get_wch()
+                except curses.error:
+                    continue
+                if key in ("\x1b", "\x03", "q"):
+                    return None
+                if not selectable:
+                    if key in (curses.KEY_RIGHT, "\t", "n", "\n", "\r", curses.KEY_ENTER):
+                        return "next"
+                    continue
+                item = items[selectable[selected]]
+                if key in (curses.KEY_DOWN, "j"):
+                    selected = (selected + 1) % len(selectable)
+                elif key in (curses.KEY_UP, "k"):
+                    selected = (selected - 1) % len(selectable)
+                elif key == " ":
+                    item["on"] = not item["on"]
+                elif key in ("\n", "\r", curses.KEY_ENTER):
+                    name = self.prompt(f"{'Login' if item['kind'] == 'account' else 'Profile'} name for {item['h'].name}",
+                                       item["target"])
+                    if name and self.attempt(validate_name, name)[0]:
+                        item["target"] = name
+                elif key in (curses.KEY_RIGHT, "\t", "n"):
+                    blocked = [i for i in items if i["on"] and "pick another" in self.setup_note(i)]
+                    if blocked:
+                        self.message = f"{blocked[0]['h'].name} history: pick another profile name or untick it"
+                    else:
+                        return "next"
+        finally:
+            self.screen.timeout(-1)
+
+    def setup_plan(self, items):
+        """the steps applying ITEMS takes, in order: logins before histories."""
+        steps = []
+        for item in sorted((i for i in items if i["on"]), key=lambda i: i["kind"] != "account"):
+            h, t = item["h"], item["target"]
+            if item["kind"] == "account":
+                steps.append((f"{h.name} login {t} ← your {h.name} account", ops.login_add, (h, t, True), None))
+            else:
+                if not Profile(h, t).exists():
+                    steps.append((f"{h.name} profile {t}", ops.new, (h, t), None))
+                steps.append((f"{h.name} history → profile {t} ({human(item['size']) if item['size'] else '…'})",
+                              ops.import_history, (h, t), item.get("size")))
+        return steps
+
+    def setup_review(self, items):
+        steps = self.setup_plan(items)
+        lines = [label for label, *_ in steps] or ["Nothing to import · only the sandbox defaults were saved"]
+        action = self.menu("setup 3/3 · review", lines, "This is what happens next. Copies run one after another.",
+                           {"a": "apply", "b": "back"})
+        return "back" if action in (None, "b") else "apply"
+
+    def setup_apply(self, items):
+        steps = self.setup_plan(items)
+        state = [["pending", ""] for _ in steps]
+
+        def work():
+            for i, (_, fn, args, _) in enumerate(steps):
+                state[i][0] = "running"
+                try:
+                    fn(*args)
+                    state[i][0] = "done"
+                except Exception as e:
+                    state[i] = ["failed", str(e)]
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        staged, sized = 0, 0
+        self.screen.timeout(150)
+        try:
+            tick = 0
+            while True:
+                tick += 1
+                if time.time() - sized > 1:                # what the running copy has written so far
+                    staged, sized = dir_size(ROOT / ".staging"), time.time()
+                self.frame("setup · applying")
+                height, width = self.screen.getmaxyx()
+                for y, ((label, _, _, total), (status, why)) in enumerate(zip(steps, state), 3):
+                    glyph, attr = {"pending": ("·", curses.A_DIM), "done": ("✓", self.color(2)),
+                                   "failed": ("✗", self.color(4))}.get(status, (self.SPIN[tick % len(self.SPIN)], self.color(1)))
+                    self.at(y, 3, glyph, 1, attr | curses.A_BOLD)
+                    text = label + (f"  {min(99, staged * 100 // total)}%" if status == "running" and total else "")
+                    self.at(y, 5, text + (f" · {why}" if why else ""), width - 8, self.color(4) if why else 0)
+                done = not worker.is_alive()
+                self.at(1, 2, "All done." if done else "Copying… you can leave this open; the originals are untouched.",
+                        width - 4, curses.A_DIM)
+                self.at(height - 2, 2, "⏎ open the launcher" if done else "working…", width - 4, curses.A_DIM)
+                self.screen.refresh()
+                try:
+                    key = self.screen.get_wch()
+                except curses.error:
+                    continue
+                if done and key in ("\n", "\r", curses.KEY_ENTER, "\x1b", "q"):
+                    break
+        finally:
+            self.screen.timeout(-1)
+        # each harness defaults to what was just imported
+        for h in HARNESSES.values():
+            mine = {i["kind"]: i["target"] for i in items if i["h"] is h}
+            profile, login = mine.get("history"), mine.get("account")
+            if profile or login:
+                current = Config.defaults(h)
+                if Profile(h, profile or current[0]).exists():
+                    self.attempt(Config.set_defaults, h, profile or current[0], login or current[1])
+        Config.update(lambda raw: raw.update(onboarding_complete=True, seen_version=VERSION))
+        failed = sum(1 for status, _ in state if status == "failed")
+        self.message = f"Setup finished with {failed} problem{'s' * (failed != 1)}" if failed else "Setup finished"
+
+    def whats_new(self, news, new):
+        """release notes and new settings since the user last looked; shown once."""
+        lines = []
+        for n in news:
+            lines += [("head", f"{n['version']} · {n['date']}")] + [("note", note) for note in n["notes"]] + [("gap", "")]
+        if new:
+            lines.append(("head", "new settings · on their defaults until you change them"))
+            for k in new:
+                lines += [("setting", k), ("desc", SETTINGS[k].description), ("gap", "")]
+        top = 0
+        while True:
+            self.frame(f"what's new in {VERSION}")
+            height, width = self.screen.getmaxyx()
+            room = height - 5
+            for y, (kind, text) in enumerate(lines[top:top + room], 2):
+                if kind == "head":
+                    self.at(y, 2, text, width - 4, curses.A_BOLD | self.color(1))
+                elif kind == "note":
+                    self.at(y, 4, "· " + text, width - 7, 0)
+                elif kind == "setting":
+                    value = self.brief_value(DEFAULTS[text])
+                    self.at(y, 4, text, 20, curses.A_BOLD)
+                    self.at(y, 25, value, width - 28, curses.A_DIM)
+                elif kind == "desc":
+                    self.at(y, 6, text, width - 9, curses.A_DIM)
+            more = "↑↓ scroll  " if len(lines) > room else ""
+            self.at(height - 2, 2, more + ("s review settings  " if new else "") + "⏎ continue", width - 4, curses.A_DIM)
+            self.screen.refresh()
+            key = self.screen.get_wch()
+            if key in (curses.KEY_DOWN, "j") and top + room < len(lines):
+                top += 1
+            elif key in (curses.KEY_UP, "k") and top:
+                top -= 1
+            elif key == "s" and new:
+                self.settings()
+                break
+            elif key in ("\n", "\r", curses.KEY_ENTER, "\x1b", "q", " "):
+                break
+        self.attempt(Config.mark_seen)
+
+    def checklist(self, title, options, chosen, detail=""):
+        """pick any of OPTIONS (⏎ toggles, s accepts); returns the picked ones, or None on esc."""
+        picked, selected = [o for o in chosen if o in options] + [c for c in chosen if c not in options], 0
+        while True:
+            items = [("[x] " if o in picked else "[ ] ") + o for o in options]
+            action = self.menu(title, items or ["(none found)"], detail, {"a": "type a name", "s": "accept"}, selected)
+            if action is None:
+                return None
+            if action == "s":
+                return picked
+            if action == "a":
+                if (name := self.prompt("Key name")) and name not in picked:
+                    picked.append(name)
+                    options = options + [name] if name not in options else options
+            elif isinstance(action, int) and options:
+                selected, o = action, options[action]
+                picked = [p for p in picked if p != o] if o in picked else picked + [o]
 
     def stop_daemon(self, h, name):
         """stop the profile's background daemon, after saying what is still running on it."""
         p = Profile(h, name)
         daemons = p.daemon_logins()
-        if not daemons:
+        sessions, procs, _ = self.survey.profile(h, name) if self.survey else ((), (), None)
+        if not daemons and not procs:
             self.message = f"No daemon is running on {name}"
             return False
-        sessions, procs, _ = self.survey.profile(h, name) if self.survey else ((), (), None)
         pids = ", ".join(str(pid) for pid, _ in procs)
-        detail = (f"Daemon under {', '.join(daemons)}" + (f" (pid {pids})" if pids else "") + ". Its background agents stop too. "
+        detail = ((f"Daemon under {', '.join(daemons)}" if daemons else "Leftover background processes")
+                  + (f" (pid {pids})" if pids else "") + ". Its background agents and their commands are killed too. "
                   + (f"{len(sessions)} session{'s' * (len(sessions) != 1)} still open on this profile "
                      f"({', '.join(sorted({l or '?' for _, l in sessions}))}); they lose their background agents."
                      if sessions else "No sessions are open on this profile."))
         if not self.confirm(f"Stop the background daemon of {name}?", detail):
             return False
         self.terminal(ops.stop_daemons, p)
-        self.message = f"Daemon of {name} stopped" if not p.daemon_logins() else f"The daemon of {name} is still running"
-        return not p.daemon_logins()
+        left = p.daemon_logins() or [pid for pid, prof, _, kind in h.processes() if kind == "daemon" and prof == str(p.path)]
+        self.message = f"The daemon of {name} is still running" if left else f"Daemon of {name} stopped"
+        return not left
 
     def profile_menu(self, h, name):
         while True:
-            items = ["Rename profile", "Delete profile"] + ["Stop background daemon"] * bool(Profile(h, name).daemon_logins())
+            items = ["Rename profile", "Delete profile"]
             action = self.menu(f"{h.name} / Profile {name}", items + ["Back"],
                                "Conversation history; account selection is independent")
             if action is None or action == len(items):
                 return name
             if items[action] == "Rename profile":
                 name = self.rename_profile(h, name)
-            elif items[action] == "Stop background daemon":
-                self.stop_daemon(h, name)
-            elif self.confirm(f"Delete profile {name}?", "Conversation history is deleted. Accounts are kept. "
-                              "Its background daemon is stopped first."):
+            elif self.confirm(f"Delete profile {name}?", f"Its history in {', '.join(p.h.name for p in ops.parts(name))} is deleted. "
+                              "Logins are kept. Background daemons are stopped first."):
                 self.terminal(ops.rm, h, name)
                 if not Profile(h, name).exists():
                     return None
@@ -2607,6 +3168,14 @@ class TerminalUI:
 
     def edit_setting(self, key, value):
         s = SETTINGS[key]
+        if key == "ssh_keys":
+            try:
+                names = sorted(p.name for p in (HOME / ".ssh").iterdir()
+                               if p.is_file() and not p.name.endswith(".pub") and p.with_name(p.name + ".pub").exists())
+            except OSError:
+                names = []
+            picked = self.checklist("ssh_keys", names, value, "Keys in ~/.ssh that have a .pub beside them (only their names are read)")
+            return None if picked is None else Config.parse(key, picked)
         if isinstance(s.default, bool) or s.choices:
             choices = list(s.choices) if s.choices else [False, True]
             action = self.menu(key, [self.display(v) for v in choices], s.description, initial=choices.index(value))
@@ -2634,11 +3203,11 @@ class TerminalUI:
             return ", ".join(value) or "(none)"
         return str(value) or "(none)"
 
-    def settings(self, h=None, name=None):
+    def settings(self, h=None, name=None, wizard=False):
         """grouped settings in the launcher's frame; edits stay a draft until s saves them."""
         global_raw = Config.read()
         scoped = h is not None and name is not None
-        base = copy.deepcopy(global_raw.get("profile_settings", {}).get(f"{h.name}/{name}", {})) if scoped else global_raw
+        base = copy.deepcopy(global_raw.get("profile_settings", {}).get(name, {})) if scoped else global_raw
         draft = copy.deepcopy(base)
         groups = [(title, [k for k in keys if not scoped or SETTINGS[k].scope == "profile"]) for title, keys in self.GROUPS]
         groups = [(title, keys) for title, keys in groups if keys]
@@ -2648,8 +3217,10 @@ class TerminalUI:
             inherited = Config.effective(global_raw)
             effective = {**(inherited if scoped else Config.effective(draft)), **draft}   # the draft holds every override
             changed = [k for k in keys if draft.get(k) != base.get(k) or (k in draft) != (k in base)]
-            key = self.draw_settings(f"{h.name}/{name} · sandbox" if scoped else "global defaults", groups,
-                                     keys[selected], effective, inherited, draft, changed, scoped)
+            key = self.draw_settings("setup 2/3 · sandbox defaults" if wizard else f"{name} · sandbox" if scoped
+                                     else "global defaults", groups, keys[selected], effective, inherited, draft, changed, scoped, wizard)
+            if wizard and key in (curses.KEY_RIGHT, "\t", "n"):
+                key = "s"
             if key in ("\x1b", "\x03", "q"):
                 if not changed or self.confirm("Discard unsaved settings?", f"{len(changed)} unsaved: {', '.join(changed)}"):
                     return
@@ -2677,13 +3248,13 @@ class TerminalUI:
                 if success and new is not None:
                     draft[keys[selected]] = new
 
-    def draw_settings(self, title, groups, current, effective, inherited, draft, changed, scoped):
+    def draw_settings(self, title, groups, current, effective, inherited, draft, changed, scoped, wizard=False):
         self.frame(title)
         height, width = self.screen.getmaxyx()
         accent, dim, bold = self.color(1), curses.A_DIM, curses.A_BOLD
         inner = width - 4
-        self.at(1, 2, "applies to this profile only; the rest comes from the global defaults" if scoped
-                else "every profile inherits these unless it overrides them", inner, dim)
+        self.at(1, 2, "applies to this profile (every tool in it); the rest comes from the global defaults" if scoped
+                else "every profile inherits these unless it overrides them · change them later with s", inner, dim)
         lines = []
         for title_, ks in groups:
             lines += [None, ("head", title_)] + [("key", k) for k in ks]
@@ -2723,7 +3294,8 @@ class TerminalUI:
             origin = "" if current in draft else f"silo's default · ⏎ changes it"
         self.at(y + 3, 2, origin, inner, dim)
         self.put(height - 3, self.message or (f"● {len(changed)} unsaved · s saves" if changed else ""), self.color(3))
-        keys = "↑↓ select  ⏎ edit  r reset  R reset all  s save" + ("  g global" if scoped else "") + "  esc back"
+        keys = ("↑↓ select  ⏎ edit  r reset  → next (saves)  esc next without saving" if wizard else
+                "↑↓ select  ⏎ edit  r reset  R reset all  s save" + ("  g global" if scoped else "") + "  esc back")
         self.at(height - 2, 2, keys, inner, dim)
         self.screen.refresh()
         return self.screen.get_wch()
@@ -2791,7 +3363,9 @@ class TerminalUI:
             for _, login in items:
                 counts[login or "?"] = counts.get(login or "?", 0) + 1
             return ", ".join(f"{k} ×{n}" if n > 1 else k for k, n in counts.items())
-        bits = [human(size) if size is not None else "sizing…"]
+        have = [hh.name for hh in HARNESSES.values() if Profile(hh, name).exists()]
+        bits = [" + ".join(have) if h.name in have else f"{' + '.join(have)} · {h.name} starts fresh on first launch",
+                human(size) if size is not None else ("—" if h.name not in have else "sizing…")]
         bits.append(f"{len(sessions)} session{'s' * (len(sessions) != 1)} open" + (f" ({who(sessions)})" if sessions else ""))
         bits.append(f"daemon: {who(daemons)} (pid {', '.join(str(p) for p, _ in daemons)})" if daemons else "no daemon")
         return " · ".join(bits)
@@ -2833,7 +3407,12 @@ class TerminalUI:
             self.at(2, 11, self.brief(h, selection.profile, survey), inner - 9, dim)
 
         # detail block for the selected login, sized first so the list gets the rest
-        s = usage.snapshot(h, selection.login) if selection.login else UsageSnapshot(error="No logins yet · a adds one")
+        daemons_all = survey.daemons()
+        selection.daemons = list(daemons_all)
+        if selection.bg not in daemons_all:
+            selection.bg = None
+        s = UsageSnapshot() if selection.shell or selection.bg else usage.snapshot(h, selection.login) if selection.login \
+            else UsageSnapshot(error="No logins yet · a adds one")
         logged_in = bool(selection.login) and Login(h, selection.login).logged_in() and s.error != "not logged in"
         detail_rows = 3 + max(1, 2 * len(s.rows) - 1)
         rows = []
@@ -2842,10 +3421,15 @@ class TerminalUI:
             if members or hh is h:
                 rows.append((hh.name, None))
                 rows.extend(members or [(hh.name, "")])
+        if selection.shells:
+            rows += [("shell", None)] + [("shell", name) for name, _ in selection.shells]
+        if daemons_all:
+            rows += [("background", None)] + [("background", key) for key in daemons_all]
         list_top = 4
         room = height - 4 - detail_rows - 1 - list_top
         visible = max(1, min(len(rows), room - sum(1 for _, n in rows if n is None) + 1))
-        current = (h.name, selection.login)
+        current = ("background", selection.bg) if selection.bg else ("shell", selection.shell) if selection.shell \
+            else (h.name, selection.login)
         index = rows.index(current) if current in rows else 0
         start = max(0, min(index - visible + 1, len(rows) - visible))
         ys, y = [], list_top
@@ -2859,7 +3443,7 @@ class TerminalUI:
         sessions = survey.profile(h, selection.profile)[0] if selection.profile else ()
         # one grid for every row and every frame, so nothing moves while you browse
         name_width = min(28, max([8] + [len(n) for _, n in rows if n]))
-        snaps = {(t, n): usage.snapshot(HARNESSES[t], n) for t, n in rows if n}
+        snaps = {(t, n): usage.snapshot(HARNESSES[t], n) for t, n in rows if n and t not in ("shell", "background")}
         windows = [r for snap in snaps.values() for r in snap.rows]
         label_width = min(10, max([2] + [len(r.label) for r in windows]))
         slots = max([2] + [len(snap.rows) for snap in snaps.values()])
@@ -2872,6 +3456,19 @@ class TerminalUI:
             if not name:
                 self.at(y, 4, "no logins · a adds one", inner, dim)
                 continue
+            if tool == "shell":
+                chosen = (tool, name) == current
+                self.at(y, 2, ("› " if chosen else "  ") + name, name_width + 2, bold | accent if chosen else 0)
+                self.at(y, cells_x, dict(selection.shells)[name], inner - cells_x, dim)
+                if n := len(self.held_sessions(h, selection.profile, selection.login, dict(selection.shells)[name])):
+                    self.at(y, width - 6 - 12, f"{n:>3} running", 12, dim)
+                continue
+            if tool == "background":
+                chosen, procs = (tool, name) == current, daemons_all[name]
+                self.at(y, 2, ("› " if chosen else "  ") + name, name_width + 2, bold | accent if chosen else 0)
+                self.at(y, cells_x, f"{', '.join(sorted({l or '?' for _, l in procs}))} · "
+                        f"{len(procs)} process{'es' * (len(procs) != 1)}", inner - cells_x, dim)
+                continue
             hh, chosen = HARNESSES[tool], (tool, name) == current
             default = name == Config.defaults(hh)[1]
             label = name if len(name) <= name_width else name[:name_width - 1] + "…"
@@ -2882,6 +3479,8 @@ class TerminalUI:
                     marks.append("● bg")
                 if n := sum(1 for _, l in sessions if l == name):
                     marks.append(f"{n} open")
+            if detached := sum(1 for x in self.held_sessions(hh, selection.profile, name) if not x.meta.get("attached")):
+                marks.append(f"{detached} detached")
             marks = " · ".join(marks)
             self.at(y, width - 6 - len(marks), marks, len(marks), dim)
             x = cells_x
@@ -2899,14 +3498,31 @@ class TerminalUI:
 
         # detail
         y = list_end + 1
+        if selection.bg:
+            procs = daemons_all[selection.bg]
+            title = f"── background · {selection.bg} "
+            self.at(y, 2, title + "─" * max(0, inner - len(title)), inner, dim)
+            self.at(y + 1, 2, f"pid {', '.join(str(p) for p, _ in procs)}", inner, 0)
+            self.at(y + 2, 2, "keeps the sandbox paths it started with · stop it so new launches pick up changed settings", inner, dim)
+            self.at(y + 3, 2, "⏎ opens its agents (claude agents) · x stops it, killing its agents and their commands", inner, dim)
+        elif selection.shell:
+            title = f"── shell · {selection.shell} "
+            self.at(y, 2, title + "─" * max(0, inner - len(title)), inner, dim)
+            self.at(y + 1, 2, f"{selection.shell_path()} inside the {h.name} sandbox of profile {selection.profile or '(none)'}", inner, 0)
+            tools = [f"{h.name} as {selection.login or '(none)'}"] + [
+                f"{q.h.name} as {q.login.name}" for q in Profile(h, selection.profile).siblings() if q.login.exists()] \
+                if selection.profile else []
+            self.at(y + 2, 2, "with " + " · ".join(tools) + " · the profile's paths, brokers and limits" if tools else "", inner, dim)
+            self.at(y + 3, 2, "run any of them inside · exit returns here", inner, dim)
         email = Login(h, selection.login).account() if selection.login else None
         email = email or s.email
         title = f"── {selection.login or 'no login'}" + (f" · {email}" if email and email not in (selection.login or "") else "") + " "
-        self.at(y, 2, title + "─" * max(0, inner - len(title)), inner, dim)
-        self.at(y + 1, 2, self.plain(s.plan) or ("" if s.loading else "plan unknown"), inner, 0)
+        if not (selection.shell or selection.bg):
+            self.at(y, 2, title + "─" * max(0, inner - len(title)), inner, dim)
+            self.at(y + 1, 2, self.plain(s.plan) or ("" if s.loading else "plan unknown"), inner, 0)
         age = int(max(0, time.time() - s.at)) if s.at else None
         state = []
-        if selection.login and not logged_in:
+        if selection.login and not logged_in and not selection.bg:
             state.append("not logged in — launching asks you to log in; m → Authenticate")
         if age is not None:
             state.append("updated just now" if age < 60 else f"from {self.plain(_until(time.time() + age))} ago")
@@ -2914,7 +3530,8 @@ class TerminalUI:
             state.append("refreshing…")
         if s.error and (logged_in or s.error != "not logged in"):
             state.append(s.error)
-        self.at(y + 2, 2, " · ".join(state) or "Loading usage…", inner, self.color(3) if not logged_in or s.error else dim)
+        if not (selection.shell or selection.bg):
+            self.at(y + 2, 2, " · ".join(state) or "Loading usage…", inner, self.color(3) if not logged_in or s.error else dim)
         dimmed = not logged_in or (age or 0) > self.STALE
         bar_width = min(24, max(8, width - 70))
         for i, r in enumerate(s.rows):
@@ -2949,16 +3566,66 @@ class TerminalUI:
                         self.at(i, x, f"{key:>2}", 2, bold | accent)
                         self.at(i, x + 4, what, column_width - 5, 0)
                 y += 2 + max(len(keys) for _, keys in row)
-        launch = f"⏎ launch {h.name} · {selection.profile or '(no profile)'} · {selection.login or '(no login)'}"
+        resume = "resume or new " if self.held_sessions(h, selection.profile, selection.login, selection.shell_path()) else ""
+        launch = f"⏎ open background agents · x stop daemon · {selection.bg}" if selection.bg else f"⏎ {resume}{'shell ' + selection.shell if selection.shell else 'launch ' + h.name} · {selection.profile or '(no profile)'} · " \
+                 f"{selection.login or '(no login)'}"
         keys = "? or esc closes keys" if self.show_keys else "←→ profile  ↑↓ login  s settings  r refresh  ? keys  q quit"
         self.at(height - 2, 2, launch, inner - len(keys) - 2, bold | accent)
         self.at(height - 2, width - 2 - len(keys), keys, len(keys), dim)
         self.screen.refresh()
         return True
 
-    KEYS = (("go", (("⏎", "launch"), ("←→", "profile"), ("↑↓", "login"), ("q", "quit"))),
+    def held_sessions(self, h, profile, login, shell=None):
+        """this launch's running sessions (refreshed at most once a second)."""
+        if time.time() - getattr(self, "_held_at", 0) > 1:
+            self._held, self._held_at = Session.all(), time.time()
+        return [x for x in self._held if (lambda m: m.get("tool") == h.name and m.get("profile") == profile
+                and m.get("login") == login and m.get("shell") == shell)(x.meta)]
+
+    def open_agents(self, h, name, procs):
+        """the tool's own background-agent manager (claude agents), in the sandbox of the daemon's login."""
+        logins = sorted({l for _, l in procs if l})
+        if not logins:
+            self.message = "Cannot tell which login this daemon runs under"
+            return
+        login = logins[0]
+        if len(logins) > 1:
+            index = self.menu(f"Background agents of {h.name}/{name}", logins, "The daemon runs under several logins")
+            if index is None:
+                return
+            login = logins[index]
+        def go():
+            session = Session.start(h, name, login, ("agents",))
+            rc = session.attach()
+            self._held_at = 0
+            return ("detached", session.id) if rc is None else rc
+        if isinstance(result := self.terminal(go), tuple):
+            self.message = f"Session #{result[1]} keeps running · silo attach {result[1]}"
+
+    def launch(self, selection):
+        """Enter: resume a running session of this profile + login (+ shell), or start a new one."""
+        h, shell = selection.h, selection.shell_path()
+        running = self.held_sessions(h, selection.profile, selection.login, shell)
+        chosen = None
+        if running:
+            items = [f"Attach {x.label()}" for x in running] + ["Start a new session"]
+            index = self.menu("Resume or start", items, "Several terminals may attach to one session · ctrl-] detaches")
+            if index is None:
+                return
+            chosen = running[index] if index < len(running) else None
+
+        def go():
+            session = chosen or Session.start(h, selection.profile, selection.login, (), shell)
+            rc = session.attach()
+            self._held_at = 0
+            return ("detached", session.id) if rc is None else rc
+        result = self.terminal(go)
+        if isinstance(result, tuple):
+            self.message = f"Session #{result[1]} keeps running · Enter here resumes it · silo attach {result[1]}"
+
+    KEYS = (("go", (("⏎", "launch · resume"), ("←→", "profile"), ("↑↓", "login · shell · daemon"), ("x", "stop daemon"), ("^]", "detach (in a session)"), ("q", "quit"))),
             ("create", (("n", "new profile"), ("a", "add login"), ("o", "setup · import"))),
-            ("change", (("e", "rename"), ("m", "manage · daemon"), ("s", "settings"), ("d", "save defaults"))),
+            ("change", (("e", "rename"), ("m", "manage"), ("s", "settings"), ("d", "save defaults"))),
             ("usage", (("r", "refresh now"), ("?", "close this"))))
 
     def action(self, key, selection, usage):
@@ -2988,7 +3655,7 @@ class TerminalUI:
             elif index is not None:
                 selection.login = self.rename_login(selection.h, selection.login)
         elif key == "o":
-            self.onboarding()
+            self.setup()
         elif key == "s":
             items = [f"Sandbox settings for {selection.h.name}/{selection.profile}"] * bool(selection.profile) + \
                     ["Global defaults (every profile inherits these)"]
@@ -3002,7 +3669,12 @@ class TerminalUI:
         self.init_colors()
         if not Config.effective(Config.read())["onboarding_complete"] \
                 and not any(Profile.all(h) or Login.all(h) for h in HARNESSES.values()):
-            self.onboarding()
+            self.setup()
+        if Config.effective(Config.read())["check_updates"] != "never":
+            threading.Thread(target=fetch_news, daemon=True).start()   # shows next time if it brings news
+        news, new = unseen(Config.read())
+        if news or new:
+            self.whats_new(news, new)
         selection, usage, survey = LauncherSelection(self.h.name), AsyncUsage(), Survey()
         self.survey = survey
         try:
@@ -3038,9 +3710,23 @@ class TerminalUI:
                 elif key == "d":
                     if self.attempt(selection.save_defaults)[0]:
                         self.message = "Profile and login defaults saved"
+                elif key in ("\n", "\r", curses.KEY_ENTER, "x") and selection.bg:
+                    self.screen.timeout(-1)
+                    try:
+                        tool, name = selection.bg.split("/", 1)
+                        if key == "x":
+                            self.stop_daemon(HARNESSES[tool], name)
+                        else:
+                            self.open_agents(HARNESSES[tool], name, survey.daemons().get(selection.bg, ()))
+                    finally:
+                        self.screen.timeout(150)
                 elif key in ("\n", "\r", curses.KEY_ENTER):
                     if selection.profile and selection.login:
-                        self.terminal(ops.run, selection.h, selection.profile, selection.login)
+                        self.screen.timeout(-1)
+                        try:
+                            self.launch(selection)
+                        finally:
+                            self.screen.timeout(150)
                     else:
                         self.message = "n creates a profile" if not selection.profile else "a adds a login"
                 elif key in ("n", "a", "m", "s", "e", "o"):

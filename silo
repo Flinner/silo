@@ -242,21 +242,25 @@ class Harness:
         return None
 
     def processes(self):
-        """[(pid, profile dir, login or None, "session" | "daemon")] of this tool, from /proc."""
+        """[(pid, profile dir or None, login or None, "session" | "agent" | "daemon")] of this tool, from /proc.
+        None: running outside silo.  "agent": a background session's worker (run straight from the versions dir)."""
         found = []
         for d in Path("/proc").iterdir():
             try:
                 argv = (d / "cmdline").read_bytes().split(b"\0")
                 argv = argv[0].split(b" ") + argv[1:]   # helpers retitle argv[0] as "claude bg-spare"
-                if not d.name.isdigit() or Path(argv[0].decode()).name != self.bin:
+                exe = Path(argv[0].decode())
+                worker = exe.parent.name == "versions" and self.bin in exe.parts
+                if not d.name.isdigit() or (exe.name != self.bin and not worker):
                     continue
                 env = dict(v.split("=", 1) for v in (d / "environ").read_bytes().decode(errors="replace").split("\0") if "=" in v)
             except (OSError, IndexError):
                 continue
             arg = argv[1].decode(errors="replace") if len(argv) > 1 else ""
-            if profile := env.get(self.config_env):
-                kind = "daemon" if arg in self.background else "session"
-                found.append((int(d.name), profile, self.env_login(env), kind))
+            profile = env.get(self.config_env)
+            profile = profile if profile and Path(profile).parent == ROOT / self.name else None
+            kind = "daemon" if arg in self.background else "agent" if worker else "session"
+            found.append((int(d.name), profile, self.env_login(env) if profile else None, kind))
         return found
 
     def account(self, ld):
@@ -2568,13 +2572,14 @@ class Survey:
                 [(pid, login) for pid, _, login, kind in procs if kind == "daemon"], size)
 
     def daemons(self):
-        """{"tool/profile": [(pid, login)]} of every profile with background processes, across tools."""
+        """{"tool/profile": [(pid, login, kind)]} of every profile with background processes, across tools;
+        "tool/" holds everything of that tool running outside silo, interactive sessions too."""
         found = {}
         with self.lock:
             for tool, procs in self.procs.items():
                 for pid, path, login, kind in procs:
-                    if kind == "daemon" and Path(path).parent == ROOT / tool:
-                        found.setdefault(f"{tool}/{Path(path).name}", []).append((pid, login))
+                    if path is None or kind != "session":
+                        found.setdefault(f"{tool}/{Path(path).name if path else ''}", []).append((pid, login, kind))
         return dict(sorted(found.items()))
 
     def busy(self, h, name):
@@ -3061,6 +3066,18 @@ class TerminalUI:
         self.message = f"The daemon of {name} is still running" if left else f"Daemon of {name} stopped"
         return not left
 
+    def stop_outside(self, h, procs):
+        """stop the daemon of a tool running outside silo (not its interactive sessions)."""
+        pids = [pid for pid, _, kind in procs if kind == "daemon"]
+        if not pids:
+            self.message = f"No {h.name} daemon is running outside silo"
+            return
+        if self.confirm(f"Stop the {h.name} daemon running outside silo?",
+                        f"pid {', '.join(map(str, pids))}. Its background agents and their commands are killed; "
+                        "interactive sessions keep running."):
+            ops.kill_tree(pids)
+            self.message = f"{h.name} daemon outside silo stopped"
+
     def profile_menu(self, h, name):
         while True:
             items = ["Rename profile", "Delete profile"]
@@ -3465,9 +3482,10 @@ class TerminalUI:
                 continue
             if tool == "background":
                 chosen, procs = (tool, name) == current, daemons_all[name]
-                self.at(y, 2, ("› " if chosen else "  ") + name, name_width + 2, bold | accent if chosen else 0)
-                self.at(y, cells_x, f"{', '.join(sorted({l or '?' for _, l in procs}))} · "
-                        f"{len(procs)} process{'es' * (len(procs) != 1)}", inner - cells_x, dim)
+                label = name.rstrip("/") + " (outside)" if name.endswith("/") else name
+                self.at(y, 2, ("› " if chosen else "  ") + label, name_width + 2, bold | accent if chosen else 0)
+                logins = sorted({l for _, l, _ in procs if l})
+                self.at(y, cells_x, " · ".join([", ".join(logins)] * bool(logins) + [self.kinds(procs)]), inner - cells_x, dim)
                 continue
             hh, chosen = HARNESSES[tool], (tool, name) == current
             default = name == Config.defaults(hh)[1]
@@ -3499,12 +3517,14 @@ class TerminalUI:
         # detail
         y = list_end + 1
         if selection.bg:
-            procs = daemons_all[selection.bg]
-            title = f"── background · {selection.bg} "
+            procs, outside = daemons_all[selection.bg], selection.bg.endswith("/")
+            title = f"── {'outside silo · ' + selection.bg.rstrip('/') if outside else 'background · ' + selection.bg} "
             self.at(y, 2, title + "─" * max(0, inner - len(title)), inner, dim)
-            self.at(y + 1, 2, f"pid {', '.join(str(p) for p, _ in procs)}", inner, 0)
-            self.at(y + 2, 2, "keeps the sandbox paths it started with · stop it so new launches pick up changed settings", inner, dim)
-            self.at(y + 3, 2, "⏎ opens its agents (claude agents) · x stops it, killing its agents and their commands", inner, dim)
+            self.at(y + 1, 2, f"{self.kinds(procs)} · pid {', '.join(str(p) for p, _, _ in procs)}", inner, 0)
+            self.at(y + 2, 2, "not sandboxed by silo: started from a plain terminal" if outside else
+                    "keeps the sandbox paths it started with · stop it so new launches pick up changed settings", inner, dim)
+            self.at(y + 3, 2, "⏎ opens its agents (claude agents) · x stops its daemon, killing its background agents"
+                    + (" (interactive sessions keep running)" if outside else " and their commands"), inner, dim)
         elif selection.shell:
             title = f"── shell · {selection.shell} "
             self.at(y, 2, title + "─" * max(0, inner - len(title)), inner, dim)
@@ -3567,7 +3587,7 @@ class TerminalUI:
                         self.at(i, x + 4, what, column_width - 5, 0)
                 y += 2 + max(len(keys) for _, keys in row)
         resume = "resume or new " if self.held_sessions(h, selection.profile, selection.login, selection.shell_path()) else ""
-        launch = f"⏎ open background agents · x stop daemon · {selection.bg}" if selection.bg else f"⏎ {resume}{'shell ' + selection.shell if selection.shell else 'launch ' + h.name} · {selection.profile or '(no profile)'} · " \
+        launch = f"⏎ open background agents · x stop daemon · {selection.bg.rstrip('/') + ' outside silo' if selection.bg.endswith('/') else selection.bg}" if selection.bg else f"⏎ {resume}{'shell ' + selection.shell if selection.shell else 'launch ' + h.name} · {selection.profile or '(no profile)'} · " \
                  f"{selection.login or '(no login)'}"
         keys = "? or esc closes keys" if self.show_keys else "←→ profile  ↑↓ login  s settings  r refresh  ? keys  q quit"
         self.at(height - 2, 2, launch, inner - len(keys) - 2, bold | accent)
@@ -3582,9 +3602,24 @@ class TerminalUI:
         return [x for x in self._held if (lambda m: m.get("tool") == h.name and m.get("profile") == profile
                 and m.get("login") == login and m.get("shell") == shell)(x.meta)]
 
+    @staticmethod
+    def kinds(procs):
+        counts = {}
+        for _, _, kind in procs:
+            counts[kind] = counts.get(kind, 0) + 1
+        words = {"session": ("interactive",) * 2, "agent": ("background agent", "background agents"),
+                 "daemon": ("daemon process", "daemon processes")}
+        return " · ".join(f"{counts[k]} {words[k][counts[k] != 1]}" for k in words if k in counts)
+
     def open_agents(self, h, name, procs):
         """the tool's own background-agent manager (claude agents), in the sandbox of the daemon's login."""
-        logins = sorted({l for _, l in procs if l})
+        if h.name != "claude":
+            self.message = f"{h.name} has no background-agent view"
+            return
+        if not name:                                     # outside silo: the host's own claude
+            self.terminal(subprocess.run, [h.bin, "agents"])
+            return
+        logins = sorted({l for _, l, _ in procs if l})
         if not logins:
             self.message = "Cannot tell which login this daemon runs under"
             return
@@ -3714,7 +3749,9 @@ class TerminalUI:
                     self.screen.timeout(-1)
                     try:
                         tool, name = selection.bg.split("/", 1)
-                        if key == "x":
+                        if key == "x" and not name:
+                            self.stop_outside(HARNESSES[tool], survey.daemons().get(selection.bg, ()))
+                        elif key == "x":
                             self.stop_daemon(HARNESSES[tool], name)
                         else:
                             self.open_agents(HARNESSES[tool], name, survey.daemons().get(selection.bg, ()))

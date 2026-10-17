@@ -2541,7 +2541,7 @@ class Survey:
     """Background look at the store: running sessions and daemons (every few seconds), profile sizes (slowly)."""
     def __init__(self):
         self.lock = threading.Lock()
-        self.procs, self.sizes = {}, {}
+        self.procs, self.sizes, self.rc = {}, {}, {}
         self.closed = threading.Event()
         threading.Thread(target=self.loop, name="silo-survey", daemon=True).start()
 
@@ -2549,8 +2549,9 @@ class Survey:
         sized = 0
         while not self.closed.is_set():
             procs = {h.name: h.processes() for h in HARNESSES.values()}
+            remote = self.remote_sessions(procs)
             with self.lock:
-                self.procs = procs
+                self.procs, self.rc = procs, remote
             if time.time() - sized > 120:
                 sized = time.time()
                 for h in HARNESSES.values():
@@ -2561,6 +2562,29 @@ class Survey:
                         with self.lock:
                             self.sizes[(h.name, p.name)] = size
             self.closed.wait(3)
+
+    @staticmethod
+    def remote_sessions(procs):
+        """{"tool/profile": [(pid, login or None, session status)]} of the live sessions under remote control (/rc),
+        from the status file each session keeps in <config>/sessions/<pid>.json.  Read straight from the
+        profiles, since a background worker's environment (and so its profile) is often unreadable."""
+        found = {}
+        for tool, ps in procs.items():
+            h, logins = HARNESSES[tool], {pid: login for pid, _, login, _ in ps}
+            for key, d in [(f"{tool}/{p.name}", p.path) for p in Profile.all(h)] + [(f"{tool}/", h.home)]:
+                for f in (Path(d) / "sessions").glob("*.json"):
+                    try:
+                        info = json.loads(f.read_text())
+                        alive = Path(f"/proc/{info['pid']}/stat").read_text().rsplit(")", 1)[1].split()[19] == info.get("procStart")
+                    except (OSError, ValueError, KeyError, IndexError):
+                        continue
+                    if alive and info.get("bridgeSessionId"):
+                        found.setdefault(key, []).append((info["pid"], logins.get(info["pid"]), info))
+        return found
+
+    def remote(self, key):
+        with self.lock:
+            return self.rc.get(key, [])
 
     def profile(self, h, name):
         """(sessions [(pid, login)], daemons [(pid, login)], size or None)."""
@@ -3385,6 +3409,8 @@ class TerminalUI:
                 human(size) if size is not None else ("—" if h.name not in have else "sizing…")]
         bits.append(f"{len(sessions)} session{'s' * (len(sessions) != 1)} open" + (f" ({who(sessions)})" if sessions else ""))
         bits.append(f"daemon: {who(daemons)} (pid {', '.join(str(p) for p, _ in daemons)})" if daemons else "no daemon")
+        if remote := survey.remote(f"{h.name}/{name}"):
+            bits.append(f"⇄ {len(remote)} remote control")
         return " · ".join(bits)
 
     def draw_dashboard(self, selection, usage, survey):
@@ -3497,6 +3523,8 @@ class TerminalUI:
                     marks.append("● bg")
                 if n := sum(1 for _, l in sessions if l == name):
                     marks.append(f"{n} open")
+                if n := sum(1 for _, l, _ in survey.remote(f"{h.name}/{selection.profile}") if l == name):
+                    marks.append(f"⇄ {n} rc")
             if detached := sum(1 for x in self.held_sessions(hh, selection.profile, name) if not x.meta.get("attached")):
                 marks.append(f"{detached} detached")
             marks = " · ".join(marks)
@@ -3525,6 +3553,7 @@ class TerminalUI:
                     "keeps the sandbox paths it started with · stop it so new launches pick up changed settings", inner, dim)
             self.at(y + 3, 2, "⏎ opens its agents (claude agents) · x stops its daemon, killing its background agents"
                     + (" (interactive sessions keep running)" if outside else " and their commands"), inner, dim)
+            self.draw_remote(y + 5, survey.remote(selection.bg), inner, height)
         elif selection.shell:
             title = f"── shell · {selection.shell} "
             self.at(y, 2, title + "─" * max(0, inner - len(title)), inner, dim)
@@ -3565,6 +3594,8 @@ class TerminalUI:
             when = f" · resets in {self.plain(_until(r.reset))}" if r.reset and r.reset > time.time() else ""
             self.at(row, 22 + bar_width, pace + when, width - bar_width - 25, dim)
 
+        if not (selection.shell or selection.bg):
+            self.draw_remote(y + 4 + 2 * len(s.rows), survey.remote(f"{h.name}/{selection.profile}"), inner, height)
         hot = [r for r in s.rows if r.percent >= 90] if not dimmed else []
         warning = "⚠ " + ", ".join(f"{r.label} at {r.percent:.0f}%" + (" (used up)" if r.percent >= 100 else
                                     f", resets in {self.plain(_until(r.reset))}") for r in hot) if hot else ""
@@ -3594,6 +3625,16 @@ class TerminalUI:
         self.at(height - 2, width - 2 - len(keys), keys, len(keys), dim)
         self.screen.refresh()
         return True
+
+    def draw_remote(self, y, remote, inner, height):
+        """the sessions under remote control (/rc): name, status, folder, start time."""
+        if not remote or y >= height - 4:
+            return
+        self.at(y, 2, "⇄ remote control", inner, curses.A_BOLD)
+        for i, (pid, _, info) in enumerate(remote[:height - 5 - y], y + 1):
+            cwd = str(info.get("cwd", "")).replace(str(HOME), "~", 1)
+            since = time.strftime("%H:%M", time.localtime(info.get("startedAt", 0) / 1000))
+            self.at(i, 4, f"{str(info.get('name') or pid)[:12]:12} {info.get('status', ''):6} {cwd[:40]:40} since {since}", inner - 2, 0)
 
     def held_sessions(self, h, profile, login, shell=None):
         """this launch's running sessions (refreshed at most once a second)."""

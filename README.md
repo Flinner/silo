@@ -276,6 +276,8 @@ $ silo config --edit              # or open the JSON in $EDITOR
 | `ssh_keys` | `[]` | Keys in `~/.ssh` loaded into the profile's private ssh-agent; empty = no ssh |
 | `ssh_config` | `false` | Let brokered ssh use your `~/.ssh/config` (identity lines stripped) |
 | `ssh_hosts` | `[]` | Allowed ssh destinations, globs ok; empty = any host |
+| `ask` | `true` | Ask with a `yad` popup instead of refusing an ssh host or brokered subcommand outside the allowlist |
+| `clipboard` | `true` | Let the agent read **images** from the host clipboard (pasting screenshots); never text |
 | `nice` | `10` | CPU niceness, 0 (normal) to 19 (lowest) |
 | `ionice` | `idle` | IO priority: `idle` \| `low` \| `normal` |
 | `memory_max` | `""` | Memory cap, e.g. `8G` or `50%`; needs a systemd user session, skipped with a warning otherwise |
@@ -329,6 +331,24 @@ runs the real `gh` with your login. A call is refused unless it matches a
 prefix (`gh pr create` matches `pr`; `gh auth token` and `gh api` match
 nothing by default) **and** the working directory is inside the sandbox's
 writable paths. The token in `~/.config/gh` is hidden from the sandbox.
+
+### Approval popups
+
+With `ask` on (and `yad` installed), a host outside `ssh_hosts` or a
+subcommand outside `brokered` is not refused outright: the broker shows a
+popup with the profile, the full command and its directory, offering **Deny**,
+**Allow once**, or **Always allow** the host or the two-word subcommand (`gh pr
+merge`), which is saved to the profile's settings. One popup at a time; no
+answer in 120 s denies. Blocked ssh options and working directories outside the
+writable paths are refused without asking.
+
+### Clipboard images
+
+The sandbox cannot reach your display, so `wl-paste` and `xclip` inside it are
+shims to the broker. It runs them on the host only to list the clipboard's
+types or read an `image/*` type, so pasting a screenshot works while text,
+writing and the primary selection stay out of reach. Turn `clipboard` off to
+drop the shims.
 
 Git over **https** has no broker: use ssh remotes (brokered above) or `gh`.
 

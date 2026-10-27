@@ -3,7 +3,7 @@
 
 https://github.com/flinner/silo  -  MIT License
 """
-import argparse, copy, curses, tempfile, sqlite3, contextlib, math
+import argparse, copy, curses, tempfile, sqlite3, contextlib, math, html, shlex
 import base64, fnmatch, urllib.request, urllib.error, json, os, re, select, shutil, signal, socket, subprocess, sys, threading, time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -511,6 +511,8 @@ SETTINGS = {
     "ssh_keys": Setting([], "SSH keys the broker loads, by name in ~/.ssh (the key files never enter the sandbox)"),
     "ssh_config": Setting(False, "Let the SSH broker use your host aliases and connection settings"),
     "ssh_hosts": Setting([], "Allowed SSH destinations (globs accepted; empty allows any host)"),
+    "ask": Setting(True, "Ask with a desktop popup (yad) before refusing an SSH host or command not on the allowlist"),
+    "clipboard": Setting(True, "Let the agent read images from the host clipboard (pasting screenshots; never text)"),
     "writable": Setting([], "Additional paths the agent may change"),
     "check_updates": Setting("ask", "ask: show an update hint; always: install; never: stay offline",
                              ("ask", "always", "never"), "global"),
@@ -936,6 +938,43 @@ sys.exit(json.loads(data or b'{{"rc": 255}}')["rc"])
 """
 
 
+class Ask(str):
+    """a refusal the user may override from a popup; GRANT is (setting, entry) for "always"."""
+    def __new__(cls, why, prompt, grant):
+        self = super().__new__(cls, why)
+        self.prompt, self.grant = prompt, grant
+        return self
+
+
+CLIP_CMDS = ("wl-paste", "xclip")
+
+
+def clip_vet(cmd, argv):
+    """None if argv only lists clipboard types or reads an image, else why not."""
+    ok = lambda t: t == "TARGETS" or re.fullmatch(r"image/[a-z0-9.+-]+", t)
+    i, a = 0, list(argv)
+    while i < len(a):
+        x = a[i]
+        if cmd == "wl-paste" and x in ("-l", "--list-types", "-n", "--no-newline"):
+            pass
+        elif cmd == "wl-paste" and x in ("-t", "--type") and i + 1 < len(a) and ok(a[i + 1]) and a[i + 1] != "TARGETS":
+            i += 1
+        elif cmd == "xclip" and x in ("-o", "-out"):
+            pass
+        elif cmd == "xclip" and x in ("-selection", "-sel") and i + 1 < len(a) and a[i + 1] in ("clipboard", "c"):
+            i += 1
+        elif cmd == "xclip" and x in ("-t", "-target") and i + 1 < len(a) and ok(a[i + 1]):
+            i += 1
+        else:
+            return "only listing clipboard types and reading images is allowed in the sandbox"
+        i += 1
+    if cmd == "xclip" and not {"-o", "-out"} & set(a):
+        return "only reading the clipboard is allowed in the sandbox"
+    if cmd == "wl-paste" and not {"-l", "--list-types", "-t", "--type"} & set(a):
+        return "only reading images from the clipboard is allowed in the sandbox"
+    return None
+
+
 def ssh_vet(argv, cfg):
     """None if ok, else the reason argv is refused."""
     dest, i = None, 0
@@ -974,13 +1013,16 @@ def ssh_vet(argv, cfg):
     host = re.sub(r":\d+$", "", host).strip("[]")
     allowed = cfg["ssh_hosts"]
     if allowed and not any(fnmatch.fnmatch(host, pat) for pat in allowed):
-        return f"host '{host}' is not in the allowed list ({', '.join(allowed)}); see silo → s settings"
+        return Ask(f"host '{host}' is not in the allowed list ({', '.join(allowed)}); see silo → s settings",
+                   f"ssh to <b>{html.escape(host)}</b>", ("ssh_hosts", host))
     return None
 
 
 def cmd_vet(cmd, argv, cwd, cfg, rt):
     """None if a brokered (non-ssh) command may run on the host, else why not."""
     allow = cfg["brokered"].get(cmd)
+    if cmd in CLIP_CMDS and cfg["clipboard"]:
+        allow = allow or []
     if allow is None or not shutil.which(cmd):
         return "not brokered; see `silo config brokered`"
     roots = [Path(r) for r in json_file(rt / "roots.json") or []]
@@ -990,12 +1032,16 @@ def cmd_vet(cmd, argv, cwd, cfg, rt):
         why = notify_vet(argv, cwd, roots)
         if why:
             return why
+    if cmd in CLIP_CMDS and cfg["clipboard"]:
+        return clip_vet(cmd, argv)
     if argv in ([], ["--help"], ["--version"]):
         return None
     words = [a for a in argv if not a.startswith("-")][:3]
     if "*" in allow or any(words[:len(a.split())] == a.split() for a in allow):
         return None
-    return f"'{cmd} {' '.join(words)}' is not in the allowlist ({', '.join(allow)})"
+    sub = " ".join(words[:2])
+    return Ask(f"'{cmd} {' '.join(words)}' is not in the allowlist ({', '.join(allow)})",
+               f"<b>{html.escape(shlex.join([cmd, *argv]))}</b>\nin {html.escape(cwd)}", ("brokered", (cmd, sub)))
 
 
 def notify_vet(argv, cwd, roots):
@@ -1143,6 +1189,10 @@ class Broker:
             else:
                 why = "no ssh key configured; see silo → s settings" if not cfg["ssh_keys"] else ssh_vet(req["argv"], cfg)
                 rc = 255 if why else self.ssh(req, fds, conn, cfg, term)
+            if isinstance(why, Ask) and cfg["ask"] and fds and self.ask(why):
+                why = None
+                rc = (self.spawn([shutil.which(cmd), *req["argv"]], req, fds, conn, cwd=req["cwd"],
+                                 env={**env, **term}) if cmd != "ssh" else self.ssh(req, fds, conn, cfg, term))
             if why:
                 os.write(fds[2], f"{cmd} (sandbox): {why}\n".encode())
             conn.sendall(json.dumps({"rc": rc}).encode())
@@ -1155,6 +1205,35 @@ class Broker:
             for f in fds:
                 os.close(f)
             conn.close()
+
+    asking = threading.Lock()                    # one popup at a time
+
+    def ask(self, why):
+        """popup: Deny / Once / Always; True to run the request.  Always also saves the grant."""
+        key, entry = why.grant
+        what = f"{entry}" if key == "ssh_hosts" else " ".join(entry)
+        if not shutil.which("yad"):
+            return False
+        with self.asking:
+            r = subprocess.run(["yad", "--title", "silo", "--image", "dialog-question", "--on-top", "--center",
+                                "--timeout", "120", "--text",
+                                f"silo/{self.run.profile.name} wants to run:\n\n{why.prompt}",
+                                "--button", "Deny:1", "--button", "Allow once:0",
+                                "--button", f"Always allow {what}:2"], stdin=subprocess.DEVNULL,
+                               capture_output=True)
+        if r.returncode == 2:
+            name = self.run.profile.name
+
+            def grant(raw):
+                prof = raw.setdefault("profile_settings", {}).setdefault(name, {})
+                cur = prof.get(key, Config.effective(raw, self.run.profile.h, name)[key])
+                if key == "ssh_hosts":
+                    prof[key] = cur + [entry] if cur and entry not in cur else cur
+                else:
+                    cmd, sub = entry
+                    prof[key] = {**cur, cmd: sorted({*cur.get(cmd, []), sub})}
+            Config.update(grant)
+        return r.returncode in (0, 2)
 
     def ssh(self, req, fds, conn, cfg, term):
         conf = self.rt / "ssh_config"
@@ -1269,7 +1348,7 @@ class Sandbox:
         b, cfg, rt = [], self.cfg, self.run.rt
         roots = set(json_file(rt / "roots.json") or [])           # roots the broker accepts as cwd
         (rt / "roots.json").write_text(json.dumps(sorted(roots | {str(r) for r in rw})))
-        shims = {c: x for c in cfg["brokered"] if (x := shutil.which(c))}
+        shims = {c: x for c in [*cfg["brokered"], *(CLIP_CMDS if cfg["clipboard"] else ())] if (x := shutil.which(c))}
         if cfg["ssh_keys"] and Path("/usr/bin/ssh").exists():
             shims["ssh"] = "/usr/bin/ssh"
         if shims:

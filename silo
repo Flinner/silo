@@ -3,7 +3,7 @@
 
 https://github.com/flinner/silo  -  MIT License
 """
-import argparse, copy, curses, tempfile, sqlite3, contextlib, math, html, shlex
+import argparse, copy, curses, functools, tempfile, sqlite3, contextlib, math, html, shlex
 import base64, fnmatch, urllib.request, urllib.error, json, os, re, select, shutil, signal, socket, subprocess, sys, threading, time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -488,7 +488,7 @@ ALIASES = {"silo": "claude", "silo-codex": "codex"}  # argv[0] -> default tool
 # config.json carries its schema version and the oldest silo that understands it.
 # Bump CONFIG_VERSION minor for added keys (older silo warns, keeps going), major for
 # incompatible changes (older silo refuses); CONFIG_MIN_SILO is the release that introduced it.
-CONFIG_VERSION = "1.6"
+CONFIG_VERSION = "1.7"
 CONFIG_MIN_SILO = "0.8.0"
 
 
@@ -521,7 +521,8 @@ SETTINGS = {
     "memory_max": Setting("", "Memory limit: for example 4G or 50%; blank leaves it unlimited"),
     "swap_max": Setting("", "Swap limit: for example 1G or 0; blank leaves it unlimited"),
     "readable": Setting([], "Additional paths the agent may read"),
-    "path_dirs": Setting(True, "Expose installed tools from PATH as read-only"),
+    "path_dirs": Setting(True, "Expose installed tools from PATH, and what their links point to, as read-only"),
+    "overlays": Setting([], "Paths the agent may change in a throwaway copy: it sees your files, its changes vanish at exit"),
     "git_config": Setting(True, "Expose your Git identity and configuration as read-only"),
     "gpg": Setting(False, "Enable signing and decryption through the host GPG agent"),
     "onboarding_complete": Setting(False, "First-run setup has been completed", scope="global"),
@@ -861,8 +862,8 @@ class Profile:
         return sorted({p.name for h in HARNESSES.values() for p in Profile.all(h)})
 
     def siblings(self):
-        """the same profile in the other tools that have it."""
-        return [Profile(h, self.name) for h in HARNESSES.values() if h is not self.h and Profile(h, self.name).exists()]
+        """the same profile in every other tool it has an account for (that tool's part is made on first use)."""
+        return [q for h in HARNESSES.values() if h is not self.h and (q := Profile(h, self.name)).login.exists()]
 
     @property
     def login(self):
@@ -1246,8 +1247,12 @@ class Broker:
             pub = key.with_name(key.name + ".pub")
             ids += ["-i", pub if pub.exists() else key]
         agent = self.rt / "agent.sock"
+        # share one connection per host across calls (socket stays host-side in rt), so bursts of
+        # short ssh/rsync/git calls don't trip the server's MaxStartups or rate limits
+        mux = [] if any(a.replace(" ", "").lower() == "controlmaster=no" for a in req["argv"]) else \
+            ["-o", "ControlMaster=auto", "-o", f"ControlPath={self.rt}/cm-%C", "-o", "ControlPersist=10m"]
         return self.spawn(["/usr/bin/ssh", "-F", conf, "-o", f"IdentityAgent={agent}", "-o", "IdentitiesOnly=yes",
-                           *ids, *req["argv"]], req, fds, conn, cwd=HOME,
+                           *mux, *ids, *req["argv"]], req, fds, conn, cwd=HOME,
                           env={**os.environ, "SSH_AUTH_SOCK": str(agent), **term})
 
 
@@ -1305,6 +1310,41 @@ def limits(cfg):
     return pre
 
 
+def package_root(target):
+    """the folder a linked executable belongs to: its venv or node package, else the folder above bin/."""
+    d = target.parent
+    while HOME in d.parents:
+        if (d / "pyvenv.cfg").exists() or (d / "package.json").exists():
+            return d
+        if d.name == "bin" and HOME in d.parent.parents:
+            return d.parent
+        d = d.parent
+    return target.parent
+
+
+def link_roots(dirs):
+    """what the links in PATH dirs need under home (uv tools, node packages, toolchains), following
+    links in those packages' bin/ too (a venv's python).  Outside home everything is visible anyway."""
+    roots, todo = [], list(dirs)
+    while todo:
+        try:
+            links = [e for e in todo.pop().iterdir() if e.is_symlink()]
+        except OSError:
+            continue
+        for e in links:
+            target = Path(os.path.realpath(e))
+            if HOME in target.parent.parents and target.exists() and not under(target, [*dirs, *roots]):
+                roots.append(package_root(target))
+                todo.append(roots[-1] / "bin")
+    return roots
+
+
+@functools.cache
+def bwrap_overlays():
+    """bwrap >= 0.8 mounts overlays; older ones get the overlay paths read-only."""
+    return "--tmp-overlay" in subprocess.run(["bwrap", "--help"], capture_output=True, text=True).stdout
+
+
 class Sandbox:
     """bwrap argv (without the command) for one profile under one login.  Home is an empty tmpfs:
     only the cwd, the profile, its login, `writable` (rw) and `readable`, PATH dirs, git config (ro) exist."""
@@ -1319,8 +1359,9 @@ class Sandbox:
         rw = [wd, self.run.dir, *(p.path for p, _ in self.tools), *(Path(p).expanduser().resolve() for p in cfg["writable"])]
         ro = [Path(p).expanduser() for p in cfg["readable"]]
         if cfg["path_dirs"]:
-            ro += [Path(p) for p in os.environ.get("PATH", "").split(":")
-                   if p and Path(p).is_dir() and HOME in Path(p).parents]
+            dirs = [Path(p) for p in os.environ.get("PATH", "").split(":")
+                    if p and Path(p).is_dir() and HOME in Path(p).parents]
+            ro += dirs + link_roots(dirs)
         if cfg["git_config"]:
             ro += [HOME / ".gitconfig", HOME / ".config/git"]
         for p, _ in self.tools:
@@ -1332,7 +1373,10 @@ class Sandbox:
                 ro.append(real)
                 if not under(exe, ro):
                     ro.append((real, Path(exe)))
-        return rw, ro
+        ov = [o for p in cfg["overlays"] if (o := Path(p).expanduser()).is_dir() and not under(o, rw)]
+        if not bwrap_overlays():
+            ro, ov = ro + ov, []
+        return rw, ro, ov
 
     def masks(self, seen):
         """secrets inside anything mapped back: every tool's login files (all accounts) + `hidden`."""
@@ -1364,7 +1408,7 @@ class Sandbox:
         if wd == HOME or wd in HOME.parents:                  # home itself, /home, /
             raise ValueError(f"run silo from a project directory: the working directory ({wd}) is mounted read-write")
         self.run.prepare()
-        rw, ro = self.mounts(wd)
+        rw, ro, ov = self.mounts(wd)
         b = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
              "--bind", self.run.dir / "tmp", "/tmp",   # persistent per-run /tmp: daemon sockets survive runs
              "--tmpfs", RUNTIME,            # hide host sockets: keyring ssh-agent, dbus, emacs, terminals
@@ -1374,11 +1418,13 @@ class Sandbox:
             src, dst = r if isinstance(r, tuple) else (r, r)
             if Path(src).exists() and not under(dst, rw):
                 b += ["--ro-bind", src, dst]
+        for o in ov:                                # after ro (may sit inside one), before rw (a cwd inside one)
+            b += ["--overlay-src", o.resolve(), "--tmp-overlay", o]
         for r in rw:
             b += ["--bind-try", r, r]
         for p, _ in self.tools:
             b += p.h.sandbox_args(p.path)
-        b += self.masks(rw + [r[1] if isinstance(r, tuple) else r for r in ro])
+        b += self.masks(rw + ov + [r[1] if isinstance(r, tuple) else r for r in ro])
         for p, login in self.tools:
             b += p.h.login_args(p.path, login.path)     # after the masks: only these logins are visible
         b += self.brokers(rw)
@@ -1408,8 +1454,8 @@ class ops:
             raise ValueError(f"no profile {p.name} (create it with new)")
         if list(args) == ["--shell"]:
             shell, args = os.environ.get("SHELL", "/bin/sh"), ()
-        # a shell gets every tool of the profile, each with its own login; the agent only itself
-        extra = [(q, q.login) for q in p.siblings() if q.login.exists()] if shell else []
+        # every tool of the profile, each with its own login: a shell, and an agent calling the other agent
+        extra = [(q.ensure(), q.login) for q in p.siblings()]
         sandbox = Sandbox(p.ensure(), login, extra=extra)
         cmd = [shell, *args] if shell else [h.bin, *args]
         return limits(sandbox.cfg) + sandbox.argv() + cmd
@@ -1548,8 +1594,9 @@ class ops:
 
     @staticmethod
     def login_use(h, profile_name, login_name):
-        p, login = Profile(h, profile_name).require(), Login(h, login_name).require()
-        p.set_login(login)
+        if profile_name not in Profile.names():          # a name shared by every tool: this one's part may come later
+            raise ValueError(f"no profile {profile_name} (create it with new)")
+        Profile(h, profile_name).set_login(Login(h, login_name).require())
         return f"{h.name} profile [bold]{profile_name}[/] now runs as login [bold]{login_name}[/]"
 
     @staticmethod
@@ -2537,54 +2584,86 @@ def available_shells():
 
 
 class LauncherSelection:
-    """A profile (←/→) and a login (↑/↓); the selected login decides the agent."""
+    """A profile (←/→) and a row (↑/↓).  The profile keeps one account per agent and every agent joins its sandbox
+    with that account: START rows run an agent or a shell in it, an agent's ACCOUNTS rows pick the account it uses,
+    BACKGROUND rows are daemons."""
     def __init__(self, tool):
         self.h = HARNESSES[tool]
-        self.profile, self.login = Config.defaults(self.h)
-        self.shell, self.shells = None, available_shells()   # a selected shell runs in the sandbox instead of the agent
-        self.bg, self.daemons = None, []      # a selected "tool/profile" row of the background section; Enter stops it
+        self.profile = Config.defaults(self.h)[0]
+        self.row = ("start", tool)
+        self.shells, self.daemons = available_shells(), []   # a selected shell runs in the sandbox instead of the agent
         self.reload()
+
+    @property
+    def shell(self):
+        return self.row[1] if self.row[0] == "shell" else None
+
+    @property
+    def bg(self):                         # a "tool/profile" of the background section; Enter opens it, x stops it
+        return self.row[1] if self.row[0] == "background" else None
+
+    @bg.setter
+    def bg(self, value):                  # the daemon has gone
+        if value is None and self.bg:
+            self.row = ("start", self.h.name)
+
+    @property
+    def picking(self):
+        """on an account row: Enter makes it the profile's account for its agent."""
+        return self.row[0] in HARNESSES
+
+    @property
+    def login(self):
+        """the account row's login, else the one the profile uses for the agent (None if that login is gone)."""
+        if self.picking:
+            return self.row[1]
+        name = self.chosen(self.h)
+        return name if (self.h.name, name) in self.accounts else None
+
+    @login.setter
+    def login(self, name):                # after a rename or delete in the manage menus
+        if self.picking:
+            self.row = (self.h.name, name) if name else ("start", self.h.name)
+
+    def chosen(self, h):
+        return Profile(h, self.profile).login.name if self.profile else Config.defaults(h)[1]
+
+    def entries(self):
+        """the selectable rows, in screen order."""
+        return ([("start", t) for t in HARNESSES] + [("shell", n) for n, _ in self.shells]
+                + self.accounts + [("background", d) for d in self.daemons])
 
     def reload(self):
         self.accounts = [(h.name, login.name) for h in HARNESSES.values() for login in Login.all(h)]
-        if (self.h.name, self.login) not in self.accounts:
-            preferred = (self.h.name, Config.defaults(self.h)[1])
-            chosen = preferred if preferred in self.accounts else next(iter(self.accounts), None)
-            if chosen:
-                self.select_account(*chosen)
-            else:
-                self.login = None
         self.defaults = Config.defaults(self.h)
         self.profiles = Profile.names()
         if self.profile not in self.profiles:
             self.profile = self.defaults[0] if self.defaults[0] in self.profiles else next(iter(self.profiles), None)
+        if self.row not in self.entries():
+            self.row = ("start", self.h.name)
 
     def select_account(self, tool, name):
-        self.h, self.login = HARNESSES[tool], name      # the profile stays: names are shared by every tool
+        self.h, self.row = HARNESSES[tool], (tool, name)
 
     def move_profile(self, direction):
         if self.profiles:
             self.profile = self.profiles[(self.profiles.index(self.profile) + direction) % len(self.profiles)]
 
     def move_login(self, direction):
-        entries = self.accounts + [("shell", name) for name, _ in self.shells] + [("background", d) for d in self.daemons]
-        current = ("background", self.bg) if self.bg else ("shell", self.shell) if self.shell else (self.h.name, self.login)
-        if not entries:
-            return
-        index = entries.index(current) if current in entries else 0
-        tool, name = entries[(index + direction) % len(entries)]
-        self.bg = name if tool == "background" else None
-        if tool == "shell":
-            self.shell = name                 # keeps the agent's profile and login: the shell runs in that sandbox
-        elif tool == "background":
-            self.shell = None
-        else:
-            self.shell = None
-            self.select_account(tool, name)
-            self.reload()
+        entries = self.entries()
+        index = entries.index(self.row) if self.row in entries else 0
+        self.row = entries[(index + direction) % len(entries)]
+        if self.row[0] == "start" or self.picking:     # a shell keeps the last agent's sandbox
+            self.h = HARNESSES[self.row[1] if self.row[0] == "start" else self.row[0]]
 
     def shell_path(self):
         return dict(self.shells).get(self.shell)
+
+    def use(self):
+        """the selected account becomes the profile's account for its agent."""
+        if not self.profile:
+            raise ValueError("n creates a profile first")
+        Profile(self.h, self.profile).set_login(Login(self.h, self.row[1]).require())
 
     def save_defaults(self):
         if not self.profile or not self.login:
@@ -3308,7 +3387,7 @@ class TerminalUI:
         text = self.prompt(key, value, s.description)
         return None if text is None else Config.parse(key, [text])
 
-    GROUPS = (("Files", ("writable", "readable", "hidden", "path_dirs", "git_config")),
+    GROUPS = (("Files", ("writable", "readable", "overlays", "hidden", "path_dirs", "git_config")),
               ("Brokered access", ("ssh_keys", "ssh_config", "ssh_hosts", "gpg", "brokered")),
               ("Resources", ("nice", "ionice", "memory_max", "swap_max")),
               ("silo", ("check_updates", "default_tool", "default_profiles", "default_logins", "logins", "onboarding_complete")))
@@ -3534,24 +3613,20 @@ class TerminalUI:
         if selection.bg not in daemons_all:
             selection.bg = None
         s = UsageSnapshot() if selection.shell or selection.bg else usage.snapshot(h, selection.login) if selection.login \
-            else UsageSnapshot(error="No logins yet · a adds one")
+            else UsageSnapshot(error=f"No {h.name} account for this profile · pick one under {h.name.upper()} ACCOUNTS")
         logged_in = bool(selection.login) and Login(h, selection.login).logged_in() and s.error != "not logged in"
         detail_rows = 3 + max(1, 2 * len(s.rows) - 1)
-        rows = []
+        rows = [("start", None)] + [("start", t) for t in HARNESSES] + [("shell", name) for name, _ in selection.shells]
         for hh in HARNESSES.values():
             members = [a for a in selection.accounts if a[0] == hh.name]
-            if members or hh is h:
-                rows.append((hh.name, None))
-                rows.extend(members or [(hh.name, "")])
-        if selection.shells:
-            rows += [("shell", None)] + [("shell", name) for name, _ in selection.shells]
+            rows.append((hh.name, None))
+            rows.extend(members or [(hh.name, "")])
         if daemons_all:
             rows += [("background", None)] + [("background", key) for key in daemons_all]
         list_top = 4
         room = height - 4 - detail_rows - 1 - list_top
         visible = max(1, min(len(rows), room - sum(1 for _, n in rows if n is None) + 1))
-        current = ("background", selection.bg) if selection.bg else ("shell", selection.shell) if selection.shell \
-            else (h.name, selection.login)
+        current = selection.row
         index = rows.index(current) if current in rows else 0
         start = max(0, min(index - visible + 1, len(rows) - visible))
         ys, y = [], list_top
@@ -3561,22 +3636,40 @@ class TerminalUI:
             ys.append(y)
             y += 1
         list_end = y
-        _, daemons, _ = survey.profile(h, selection.profile) if selection.profile else ((), (), None)
-        sessions = survey.profile(h, selection.profile)[0] if selection.profile else ()
         # one grid for every row and every frame, so nothing moves while you browse
         name_width = min(28, max([8] + [len(n) for _, n in rows if n]))
-        snaps = {(t, n): usage.snapshot(HARNESSES[t], n) for t, n in rows if n and t not in ("shell", "background")}
+        snaps = {(t, n): usage.snapshot(HARNESSES[t], n) for t, n in rows if n and t not in ("start", "shell", "background")}
         windows = [r for snap in snaps.values() for r in snap.rows]
         label_width = min(10, max([2] + [len(r.label) for r in windows]))
         slots = max([2] + [len(snap.rows) for snap in snaps.values()])
-        cells_x, marks_width = 5 + name_width, 20             # marks (default, ● bg, open) sit at the right edge
+        cells_x, marks_width = 7 + name_width, 20             # marks (default, ● bg, open) sit at the right edge
         bar = max(0, min(14, (width - 6 - marks_width - cells_x) // slots - label_width - 8))
         for (tool, name), y in zip(rows[start:start + visible], ys):
             if name is None:
-                self.at(y, 2, tool.upper(), inner, bold | dim)
+                self.at(y, 2, tool.upper() + " ACCOUNTS" * (tool in HARNESSES), inner, bold | dim)
                 continue
             if not name:
                 self.at(y, 4, "no logins · a adds one", inner, dim)
+                continue
+            if tool == "start":
+                hh, chosen, login = HARNESSES[name], (tool, name) == current, selection.chosen(HARNESSES[name])
+                self.at(y, 2, ("› " if chosen else "  ") + name, name_width + 2, bold | accent if chosen else 0)
+                if (name, login) in selection.accounts:
+                    email = Login(hh, login).account()
+                    text = f"as {login}" + (f" · {email}" if email and email != login else "")
+                else:
+                    text = f"no account · pick one under {name.upper()} ACCOUNTS" if selection.profile else ""
+                self.at(y, cells_x, text, inner - cells_x - marks_width, dim)
+                sessions, daemons, _ = survey.profile(hh, selection.profile) if selection.profile else ((), (), None)
+                marks = ["● bg"] * any(l == login for _, l in daemons)
+                if n := sum(1 for _, l in sessions if l == login):
+                    marks.append(f"{n} open")
+                if n := sum(1 for _, l, _ in survey.remote(f"{name}/{selection.profile}") if l == login):
+                    marks.append(f"⇄ {n} rc")
+                if detached := sum(1 for x in self.held_sessions(hh, selection.profile, login) if not x.meta.get("attached")):
+                    marks.append(f"{detached} detached")
+                marks = " · ".join(marks)
+                self.at(y, width - 6 - len(marks), marks, len(marks), dim)
                 continue
             if tool == "shell":
                 chosen = (tool, name) == current
@@ -3595,18 +3688,9 @@ class TerminalUI:
             hh, chosen = HARNESSES[tool], (tool, name) == current
             default = name == Config.defaults(hh)[1]
             label = name if len(name) <= name_width else name[:name_width - 1] + "…"
-            self.at(y, 2, ("› " if chosen else "  ") + label, name_width + 2, bold | accent if chosen else 0)
-            marks = ["default"] if default else []
-            if tool == h.name:
-                if any(l == name for _, l in daemons):
-                    marks.append("● bg")
-                if n := sum(1 for _, l in sessions if l == name):
-                    marks.append(f"{n} open")
-                if n := sum(1 for _, l, _ in survey.remote(f"{h.name}/{selection.profile}") if l == name):
-                    marks.append(f"⇄ {n} rc")
-            if detached := sum(1 for x in self.held_sessions(hh, selection.profile, name) if not x.meta.get("attached")):
-                marks.append(f"{detached} detached")
-            marks = " · ".join(marks)
+            used = "✓ " if selection.profile and name == selection.chosen(hh) else "  "    # the profile's account
+            self.at(y, 2, ("› " if chosen else "  ") + used + label, name_width + 4, bold | accent if chosen else 0)
+            marks = " · ".join(["default"] if default else [])
             self.at(y, width - 6 - len(marks), marks, len(marks), dim)
             x = cells_x
             snap = snaps[(tool, name)]
@@ -3638,8 +3722,7 @@ class TerminalUI:
             self.at(y, 2, title + "─" * max(0, inner - len(title)), inner, dim)
             self.at(y + 1, 2, f"{selection.shell_path()} inside the {h.name} sandbox of profile {selection.profile or '(none)'}", inner, 0)
             tools = [f"{h.name} as {selection.login or '(none)'}"] + [
-                f"{q.h.name} as {q.login.name}" for q in Profile(h, selection.profile).siblings() if q.login.exists()] \
-                if selection.profile else []
+                f"{q.h.name} as {q.login.name}" for q in Profile(h, selection.profile).siblings()] if selection.profile else []
             self.at(y + 2, 2, "with " + " · ".join(tools) + " · the profile's paths, brokers and limits" if tools else "", inner, dim)
             self.at(y + 3, 2, "run any of them inside · exit returns here", inner, dim)
         email = Login(h, selection.login).account() if selection.login else None
@@ -3697,9 +3780,10 @@ class TerminalUI:
                         self.at(i, x + 4, what, column_width - 5, 0)
                 y += 2 + max(len(keys) for _, keys in row)
         resume = "resume or new " if self.held_sessions(h, selection.profile, selection.login, selection.shell_path()) else ""
-        launch = f"⏎ open background agents · x stop daemon · {selection.bg.rstrip('/') + ' outside silo' if selection.bg.endswith('/') else selection.bg}" if selection.bg else f"⏎ {resume}{'shell ' + selection.shell if selection.shell else 'launch ' + h.name} · {selection.profile or '(no profile)'} · " \
+        launch = f"⏎ open background agents · x stop daemon · {selection.bg.rstrip('/') + ' outside silo' if selection.bg.endswith('/') else selection.bg}" if selection.bg \
+            else f"⏎ use {h.name} account {selection.login} in {selection.profile or '(no profile)'}" if selection.picking else f"⏎ {resume}{'shell ' + selection.shell if selection.shell else 'launch ' + h.name} · {selection.profile or '(no profile)'} · " \
                  f"{selection.login or '(no login)'}"
-        keys = "? or esc closes keys" if self.show_keys else "←→ profile  ↑↓ login  s settings  r refresh  ? keys  q quit"
+        keys = "? or esc closes keys" if self.show_keys else "←→ profile  ↑↓ start · account  s settings  r refresh  ? keys  q quit"
         self.at(height - 2, 2, launch, inner - len(keys) - 2, bold | accent)
         self.at(height - 2, width - 2 - len(keys), keys, len(keys), dim)
         self.screen.refresh()
@@ -3778,7 +3862,7 @@ class TerminalUI:
         if isinstance(result, tuple):
             self.message = f"Session #{result[1]} keeps running · Enter here resumes it · silo attach {result[1]}"
 
-    KEYS = (("go", (("⏎", "launch · resume"), ("←→", "profile"), ("↑↓", "login · shell · daemon"), ("x", "stop daemon"), ("^]", "detach (in a session)"), ("q", "quit"))),
+    KEYS = (("go", (("⏎", "launch · resume · use account"), ("←→", "profile"), ("↑↓", "start · account · daemon"), ("x", "stop daemon"), ("^]", "detach (in a session)"), ("q", "quit"))),
             ("create", (("n", "new profile"), ("a", "add login"), ("o", "setup · import"))),
             ("change", (("e", "rename"), ("m", "manage"), ("s", "settings"), ("d", "save defaults"))),
             ("usage", (("r", "refresh now"), ("?", "close this"))))
@@ -3877,6 +3961,9 @@ class TerminalUI:
                             self.open_agents(HARNESSES[tool], name, survey.daemons().get(selection.bg, ()))
                     finally:
                         self.screen.timeout(150)
+                elif key in ("\n", "\r", curses.KEY_ENTER) and selection.picking:
+                    if self.attempt(selection.use)[0]:
+                        self.message = f"{selection.profile} now uses {selection.h.name} account {selection.login}"
                 elif key in ("\n", "\r", curses.KEY_ENTER):
                     if selection.profile and selection.login:
                         self.screen.timeout(-1)
@@ -3885,7 +3972,8 @@ class TerminalUI:
                         finally:
                             self.screen.timeout(150)
                     else:
-                        self.message = "n creates a profile" if not selection.profile else "a adds a login"
+                        self.message = "n creates a profile" if not selection.profile else \
+                            f"pick a {selection.h.name} account for {selection.profile} under {selection.h.name.upper()} ACCOUNTS"
                 elif key in ("n", "a", "m", "s", "e", "o"):
                     self.screen.timeout(-1)
                     try:

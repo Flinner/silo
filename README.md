@@ -48,6 +48,8 @@ continued under any login (handy when an account hits its limit). Every run is w
 - your home is **empty** — only the working directory, the profile and paths
   you choose exist, plus your tools and git identity read-only;
 - logins, other profiles and secrets are **never there**, not even read-only;
+- the other agent is there too when the profile has it: in `silo work`, claude can
+  run codex as `codex/work` with that profile's login, and the other way round;
 - `ssh`, `gpg` and `gh` work, but through **brokers on the host**: the agent
   uses your keys and tokens without ever being able to read them.
 
@@ -165,11 +167,14 @@ Run `silo` or `silo tui` in an interactive terminal. The menu uses Python's
 built-in `curses`; no additional package is needed. `silo codex tui` puts
 Codex profiles first.
 
-- **Profiles:** arrow keys select, Enter opens launch and management actions.
-  Press `n` for a guided creation flow. Change the login for one launch or
-  save it as the profile's default, authenticate, rename, or delete a profile.
-- **Logins:** press `l` to add, authenticate, import this machine's account,
-  or delete an account. An account that profiles default to cannot be deleted.
+- **Profiles:** ←→ picks the profile, `n` creates one. A profile keeps one
+  account per agent, and every agent joins its sandbox with that account, so
+  claude can run codex (and the other way round) under the accounts you chose.
+- **Start:** the first rows run claude, codex or a shell in the profile; Enter
+  launches, or resumes a session that is still running.
+- **Accounts:** each agent's logins are listed with their usage; ✓ marks the
+  profile's account and Enter on another login switches to it. Press `a` to add
+  a login, `m` to authenticate, rename or delete one.
 - **Settings:** press `s` to edit every supported setting. Booleans and choices
   use menus; paths and permissions use editable lists and tables. Press `s`
   to save, `r` to reset one setting, or `R` to reset all. Escape cancels;
@@ -268,7 +273,8 @@ $ silo config --edit              # or open the JSON in $EDITOR
 |---|---|---|
 | `writable` | `[]` | Extra read-write paths (the cwd and the profile always are) |
 | `readable` | `[]` | Extra read-only paths |
-| `path_dirs` | `true` | Expose the `PATH` directories under your home (your installed tools), read-only |
+| `overlays` | `[]` | Paths (such as a toolchain's home) the agent sees with your files and may change; the changes are a throwaway copy that vanishes when the run ends (bwrap ≥ 0.8; older ones mount them read-only) |
+| `path_dirs` | `true` | Expose the `PATH` directories under your home (your installed tools), read-only, plus what their links point to: a uv tool's venv and its python, a node package, the folder of a linked binary |
 | `git_config` | `true` | Expose `~/.gitconfig` and `~/.config/git`, read-only |
 | `gpg` | `false` | Sign/decrypt through your gpg-agent's restricted socket |
 | `brokered` | `gh`: common subcommands | Commands run on the host, by allowed subcommand prefix |
@@ -407,9 +413,11 @@ their first run: their credentials become the login of the same name.
 persistent directory; `$XDG_RUNTIME_DIR` is replaced by an empty tmpfs (it
 holds the host ssh-agent, the session bus and editor/terminal servers — all
 ways out); your home is replaced by an empty tmpfs. Mapped back read-only: your
-`readable` paths, the `PATH` directories under your home, git config, the
+`readable` paths, the `PATH` directories under your home and the packages
+their links point to, git config, the
 tool's own binary and claude's shared instructions. Mapped back read-write: the
-working directory, the profile and your `writable` paths. Finally every login
+working directory, the profile and your `writable` paths. Your `overlays`
+are mounted copy-on-write, so the host copy never changes. Finally every login
 file and `hidden` path inside anything mapped back is masked. Writes elsewhere
 in home land in the tmpfs and vanish when the run ends.
 
@@ -464,7 +472,8 @@ its login files, and how to read the account email.
   unix sockets such as X11's remain reachable.
 - Window resizes are not forwarded to brokered interactive ssh sessions.
 - Everything under a mapped-back path is visible, so check what your
-  `readable`/`writable` paths and the PATH directories under your home contain.
+  `readable`/`writable`/`overlays` paths, the PATH directories under your home
+  and the packages their links point to contain.
 - Git over https has no credential broker; use ssh remotes or `gh`.
 - `--shell` must be the only argument after the profile name.
 
